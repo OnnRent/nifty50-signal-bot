@@ -1,1 +1,1 @@
-worker: python nifty50_optimized_signal_bot.py
+worker: python scoring_system.py
