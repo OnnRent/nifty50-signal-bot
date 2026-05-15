@@ -1,709 +1,132 @@
-# from __future__ import annotations
-
-# import dataclasses
-# import json
-# import os
-# import re
-# import time
-# from datetime import datetime
-# from typing import Any, Dict, List, Optional, Tuple
-
-# import requests
-# from dotenv import load_dotenv
-
-# load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
-
-# DHAN_BASE     = "https://api.dhan.co/v2"
-# TELEGRAM_BASE = "https://api.telegram.org"
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Config
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# @dataclasses.dataclass
-# class Config:
-#     dhan_client_id: str
-#     dhan_access_token: str
-#     telegram_bot_token: str
-#     telegram_chat_id: str
-#     underlying_security_id: int = 13
-#     underlying_segment: str = "IDX_I"
-#     underlying_name_hint: str = "NIFTY 50"
-#     strikes_window: int = 5
-#     http_timeout: int = 15
-#     tg_poll_interval: float = 1.5
-
-#     @staticmethod
-#     def from_env() -> "Config":
-#         required = {
-#             "DHAN_CLIENT_ID":     os.getenv("DHAN_CLIENT_ID", "").strip(),
-#             "DHAN_ACCESS_TOKEN":  os.getenv("DHAN_ACCESS_TOKEN", "").strip(),
-#             "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-#             "TELEGRAM_CHAT_ID":   os.getenv("TELEGRAM_CHAT_ID", "").strip(),
-#         }
-#         missing = [k for k, v in required.items() if not v]
-#         if missing:
-#             raise SystemExit("Missing env vars: " + ", ".join(missing))
-
-#         def _int(n: str, d: int) -> int:
-#             try: return int(os.getenv(n, str(d)).strip())
-#             except ValueError: return d
-
-#         def _float(n: str, d: float) -> float:
-#             try: return float(os.getenv(n, str(d)).strip())
-#             except ValueError: return d
-
-#         return Config(
-#             dhan_client_id=required["DHAN_CLIENT_ID"],
-#             dhan_access_token=required["DHAN_ACCESS_TOKEN"],
-#             telegram_bot_token=required["TELEGRAM_BOT_TOKEN"],
-#             telegram_chat_id=required["TELEGRAM_CHAT_ID"],
-#             underlying_security_id=_int("DHAN_UNDERLYING_SECURITY_ID", 13),
-#             underlying_segment=os.getenv("DHAN_UNDERLYING_SEGMENT", "IDX_I").strip(),
-#             underlying_name_hint=os.getenv("UNDERLYING_NAME_HINT", "NIFTY 50").strip(),
-#             strikes_window=_int("STRIKES_WINDOW", 5),
-#             http_timeout=_int("HTTP_TIMEOUT", 15),
-#             tg_poll_interval=_float("TG_POLL_INTERVAL", 1.5),
-#         )
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Dhan API
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# class DhanApiClient:
-#     def __init__(self, cfg: Config):
-#         self.cfg = cfg
-#         self.session = requests.Session()
-#         self.session.headers.update({
-#             "Content-Type": "application/json",
-#             "access-token": cfg.dhan_access_token,
-#             "client-id":    cfg.dhan_client_id,
-#         })
-
-#     def expiry_list(self) -> List[str]:
-#         r = self.session.post(
-#             f"{DHAN_BASE}/optionchain/expirylist",
-#             data=json.dumps({
-#                 "UnderlyingScrip": self.cfg.underlying_security_id,
-#                 "UnderlyingSeg":   self.cfg.underlying_segment,
-#             }),
-#             timeout=self.cfg.http_timeout,
-#         )
-#         r.raise_for_status()
-#         return [str(x) for x in r.json().get("data", [])]
-
-#     def option_chain(self, expiry: str) -> Dict[str, Any]:
-#         r = self.session.post(
-#             f"{DHAN_BASE}/optionchain",
-#             data=json.dumps({
-#                 "UnderlyingScrip": self.cfg.underlying_security_id,
-#                 "UnderlyingSeg":   self.cfg.underlying_segment,
-#                 "Expiry":          expiry,
-#             }),
-#             timeout=self.cfg.http_timeout,
-#         )
-#         r.raise_for_status()
-#         return r.json()
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Telegram bot
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# class TelegramBot:
-#     def __init__(self, token: str, chat_id: str, timeout: int = 15):
-#         self.token   = token
-#         self.chat_id = str(chat_id)
-#         self.timeout = timeout
-#         self.session = requests.Session()
-#         self._offset = 0
-
-#     def send(self, text: str) -> None:
-#         self.session.post(
-#             f"{TELEGRAM_BASE}/bot{self.token}/sendMessage",
-#             data={
-#                 "chat_id":                  self.chat_id,
-#                 "text":                     text,
-#                 "parse_mode":               "HTML",
-#                 "disable_web_page_preview": True,
-#             },
-#             timeout=self.timeout,
-#         ).raise_for_status()
-
-#     def get_messages(self) -> List[str]:
-#         """Poll and return new text messages from our chat."""
-#         try:
-#             r = self.session.get(
-#                 f"{TELEGRAM_BASE}/bot{self.token}/getUpdates",
-#                 params={"offset": self._offset, "timeout": 0},
-#                 timeout=self.timeout + 5,
-#             )
-#             r.raise_for_status()
-#         except Exception:
-#             return []
-
-#         texts: List[str] = []
-#         for update in r.json().get("result", []):
-#             self._offset = update["update_id"] + 1
-#             msg     = update.get("message") or update.get("channel_post") or {}
-#             chat_id = str((msg.get("chat") or {}).get("id", ""))
-#             text    = (msg.get("text") or "").strip()
-#             if chat_id == self.chat_id and text:
-#                 texts.append(text)
-#         return texts
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Helpers
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def _num(v: Any, default: float = 0.0) -> float:
-#     try:   return float(v) if v is not None else default
-#     except Exception: return default
-
-# def _fmt(v: Any, decimals: int = 2) -> str:
-#     return "—" if v is None else f"{float(v):,.{decimals}f}"
-
-# def _nearest_strike(strikes: List[float], spot: float) -> float:
-#     return min(strikes, key=lambda s: abs(s - spot))
-
-# def _parse_date(s: str):
-#     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
-#         try:   return datetime.strptime(s, fmt).date()
-#         except Exception: continue
-#     return None
-
-# def _support_resistance(oc: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-#     """Support = strike with max Put OI.  Resistance = strike with max Call OI."""
-#     best_pe, support    = -1.0, None
-#     best_ce, resistance = -1.0, None
-#     for k, row in oc.items():
-#         try:   strike = float(k)
-#         except Exception: continue
-#         pe_oi = _num(row.get("pe", {}).get("oi"))
-#         ce_oi = _num(row.get("ce", {}).get("oi"))
-#         if pe_oi > best_pe: best_pe, support    = pe_oi, strike
-#         if ce_oi > best_ce: best_ce, resistance = ce_oi, strike
-#     return support, resistance
-
-# def _pcr(oc: Dict[str, Any], center: float, window: int) -> Optional[float]:
-#     strikes = sorted(float(k) for k in oc.keys())
-#     band    = sorted(strikes, key=lambda s: abs(s - center))[: max(2, window * 2)]
-#     call_oi = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")) for s in band)
-#     put_oi  = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")) for s in band)
-#     return (put_oi / call_oi) if call_oi > 0 else None
-
-# def _max_pain(oc: Dict[str, Any]) -> Optional[float]:
-#     strikes = sorted(float(k) for k in oc.keys())
-#     if not strikes: return None
-#     oi_map = {
-#         s: (
-#             _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")),
-#             _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")),
-#         )
-#         for s in strikes
-#     }
-#     best, best_pain = None, None
-#     for settle in strikes:
-#         pain = sum(max(0.0, settle - s) * ce + max(0.0, s - settle) * pe
-#                    for s, (ce, pe) in oi_map.items())
-#         if best_pain is None or pain < best_pain:
-#             best_pain, best = pain, settle
-#     return best
-
-# def _get_row(oc: Dict[str, Any], strike: float) -> Dict[str, Any]:
-#     """Fetch the option chain row for a given strike (handles float key formats)."""
-#     return (
-#         oc.get(f"{strike:.6f}")
-#         or oc.get(f"{strike:.2f}")
-#         or oc.get(f"{strike:.0f}")
-#         or oc.get(str(int(strike)))
-#         or {}
-#     )
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Trade levels calculator
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def _trade_levels(
-#     ltp: float,
-#     side: str,              # "CE" or "PE"
-#     support: float,
-#     resistance: float,
-#     spot: float,
-#     strike: float,
-# ) -> Dict[str, float]:
-#     """
-#     Calculate buy price, sell/target price and stop loss.
-
-#     Logic:
-#     ──────
-#     CE (Call) — bullish trade
-#         Buy   : LTP  (entry at market)
-#         Target: LTP + (resistance - spot) * 0.3   (30% of move to resistance)
-#         SL    : LTP * 0.80                         (20% below entry = hard SL)
-
-#     PE (Put) — bearish trade
-#         Buy   : LTP
-#         Target: LTP + (spot - support) * 0.3      (30% of move to support)
-#         SL    : LTP * 0.80
-
-#     We also cap the SL floor at ₹2 to avoid unrealistic tiny SL for cheap OTM options.
-#     Target is capped at 3× LTP so we don't show absurd numbers on deep OTM.
-#     """
-#     if side == "CE":
-#         move      = max(resistance - spot, 0.0) if resistance else 0.0
-#         raw_target = ltp + move * 0.30
-#     else:
-#         move      = max(spot - support, 0.0) if support else 0.0
-#         raw_target = ltp + move * 0.30
-
-#     target   = min(raw_target, ltp * 3.0)          # cap at 3×
-#     target   = max(target, ltp * 1.05)             # at least 5% gain
-#     stop_loss = max(ltp * 0.80, 2.0)               # 20% SL, floor ₹2
-
-#     return {
-#         "buy":       round(ltp,        2),
-#         "target":    round(target,     2),
-#         "stop_loss": round(stop_loss,  2),
-#         "risk":      round(ltp - stop_loss, 2),
-#         "reward":    round(target - ltp,    2),
-#     }
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Message builder for strike analysis
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def _build_strike_message(
-#     side: str,                          # "CE" or "PE"
-#     strike: float,
-#     option_data: Dict[str, Any],        # ce or pe sub-dict from chain
-#     spot: float,
-#     expiry: str,
-#     support: Optional[float],
-#     resistance: Optional[float],
-#     atm: float,
-#     pcr: Optional[float],
-#     max_pain: Optional[float],
-# ) -> str:
-#     ltp        = _num(option_data.get("last_price"))
-#     prev_close = _num(option_data.get("previous_close_price"))
-#     oi         = _num(option_data.get("oi"))
-#     prev_oi    = _num(option_data.get("previous_oi"))
-#     volume     = _num(option_data.get("volume"))
-#     iv         = _num(option_data.get("implied_volatility"))
-#     bid        = _num(option_data.get("bid_price"))
-#     ask        = _num(option_data.get("ask_price"))
-
-#     oi_change   = oi - prev_oi
-#     price_chg   = ltp - prev_close
-#     price_chg_p = (price_chg / prev_close * 100) if prev_close > 0 else 0.0
-
-#     # ── trade levels ──────────────────────────────────────────────────────────
-#     if ltp <= 0:
-#         trade_note = "⚠️ LTP is 0 — option may be illiquid or market closed."
-#         levels = None
-#     else:
-#         levels = _trade_levels(ltp, side, support or 0.0, resistance or 0.0, spot, strike)
-#         rr     = (levels["reward"] / levels["risk"]) if levels["risk"] > 0 else 0.0
-#         trade_note = None
-
-#     # ── market context ────────────────────────────────────────────────────────
-#     bias = "neutral"
-#     if pcr is not None:
-#         if pcr < 0.9:   bias = "bearish"
-#         elif pcr > 1.1: bias = "bullish"
-
-#     atm_tag  = " (ATM)" if strike == atm else (" (ITM)" if
-#                (side == "CE" and strike < spot) or (side == "PE" and strike > spot)
-#                else " (OTM)")
-
-#     emoji = "📈" if side == "CE" else "📉"
-
-#     lines = [
-#         f"{emoji} <b>NIFTY {side} {strike:,.0f}{atm_tag}</b>",
-#         f"Expiry: {expiry}  |  Spot: {_fmt(spot)}",
-#         "",
-#         "─── Option Data ───────────────────",
-#         f"LTP        : ₹{_fmt(ltp)}",
-#         f"Prev Close : ₹{_fmt(prev_close)}  ({price_chg:+.2f} / {price_chg_p:+.1f}%)",
-#         f"Bid / Ask  : ₹{_fmt(bid)} / ₹{_fmt(ask)}",
-#         f"IV         : {_fmt(iv, 1)}%",
-#         f"OI         : {oi:,.0f}  (Chg: {oi_change:+,.0f})",
-#         f"Volume     : {volume:,.0f}",
-#         "",
-#         "─── Market Context ─────────────────",
-#         f"PCR        : {_fmt(pcr)}  |  Bias: {bias}",
-#         f"ATM Strike : {_fmt(atm, 0)}",
-#         f"Max Pain   : {_fmt(max_pain, 0)}",
-#         f"Support  S : {_fmt(support, 0)}   (highest PE OI)",
-#         f"Resistance R: {_fmt(resistance, 0)}  (highest CE OI)",
-#         "",
-#     ]
-
-#     if trade_note:
-#         lines.append(trade_note)
-#     else:
-#         sign      = "🟢 BUY" if side == "CE" else "🔴 BUY"
-#         lines += [
-#             "─── Trade Levels ───────────────────",
-#             f"{sign}        : ₹{_fmt(levels['buy'])}",
-#             f"🎯 Target    : ₹{_fmt(levels['target'])}",
-#             f"🛑 Stop Loss : ₹{_fmt(levels['stop_loss'])}",
-#             f"",
-#             f"Risk         : ₹{_fmt(levels['risk'])}  per lot",
-#             f"Reward       : ₹{_fmt(levels['reward'])}  per lot",
-#             f"R:R Ratio    : 1 : {rr:.1f}",
-#             "",
-#             "<i>⚠️ These are calculated levels, not financial advice.</i>",
-#             "<i>Always use your own judgment before trading.</i>",
-#         ]
-
-#     lines.append(f"\n<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>")
-#     return "\n".join(lines)
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Help text
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# HELP_TEXT = """<b>NIFTY Bot Commands</b>
-
-# <b>Strike Analysis</b>
-#   CE23700   — Analyse NIFTY 23700 Call option
-#   PE23700   — Analyse NIFTY 23700 Put option
-
-# <b>Market Overview</b>
-#   /chain    — ±5 strike option chain table
-#   /status   — Spot, PCR, bias, support, resistance
-#   /expiry   — Current weekly expiry date
-#   /help     — This help message
-
-# Just type the strike command (e.g. CE24500) and I will fetch live data instantly."""
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Chain overview helpers (used by /chain and /status)
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def _strikes_around_atm(
-#     oc: Dict[str, Any], spot: float, window: int
-# ) -> List[Tuple[float, Dict[str, Any]]]:
-#     all_strikes = sorted(float(k) for k in oc.keys())
-#     if not all_strikes: return []
-#     atm    = _nearest_strike(all_strikes, spot)
-#     nearby = sorted(all_strikes, key=lambda s: abs(s - atm))[: window * 2 + 1]
-#     return [(s, oc.get(f"{s:.6f}") or oc.get(str(s)) or {}) for s in sorted(nearby)]
-
-# def _top_oi(oc: Dict[str, Any], side: str, n: int = 3) -> List[Tuple[float, float]]:
-#     items = [(float(k), _num(v.get(side, {}).get("oi"))) for k, v in oc.items()
-#              if k.replace(".", "").lstrip("-").isdigit()]
-#     return sorted(items, key=lambda x: x[1], reverse=True)[:n]
-
-# def _build_chain_message(
-#     rows: List[Tuple[float, Dict[str, Any]]],
-#     spot: float, expiry: str,
-#     support: Optional[float], resistance: Optional[float],
-#     atm: float, pcr: Optional[float], max_pain: Optional[float],
-# ) -> str:
-#     bias = "neutral"
-#     if pcr is not None:
-#         bias = "bearish" if pcr < 0.9 else ("bullish" if pcr > 1.1 else "neutral")
-
-#     lines = [
-#         "<b>NIFTY 50 — Option Chain</b>",
-#         f"Expiry: {expiry}  |  Spot: {_fmt(spot)}  |  ATM: {_fmt(atm, 0)}",
-#         f"PCR: {_fmt(pcr)}  |  Bias: {bias}  |  Max Pain: {_fmt(max_pain, 0)}",
-#         f"Support S: {_fmt(support, 0)}   |   Resistance R: {_fmt(resistance, 0)}",
-#         "",
-#         "<b>±5 strikes around ATM</b>",
-#         "<pre>",
-#         f"{'Strike':<8} {'Tag':<7} {'CE OI':>9} {'CE LTP':>7} | {'PE LTP':>7} {'PE OI':>9}",
-#         "-" * 54,
-#     ]
-#     for strike, row in rows:
-#         ce  = row.get("ce") or {}
-#         pe  = row.get("pe") or {}
-#         tag = ("ATM" if strike == atm else "") + (" S" if strike == support else "") + (" R" if strike == resistance else "")
-#         lines.append(
-#             f"{strike:<8,.0f} {tag.strip():<7} "
-#             f"{_num(ce.get('oi')):>9,.0f} {_num(ce.get('last_price')):>7.2f} | "
-#             f"{_num(pe.get('last_price')):>7.2f} {_num(pe.get('oi')):>9,.0f}"
-#         )
-#     lines += ["</pre>", "S=Support  R=Resistance  ATM=At-the-money",
-#               f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>"]
-#     return "\n".join(lines)
-
-# def _build_status_message(
-#     spot: float, expiry: str,
-#     support: Optional[float], resistance: Optional[float],
-#     atm: float, pcr: Optional[float], max_pain: Optional[float],
-#     call_top: List[Tuple[float, float]], put_top: List[Tuple[float, float]],
-# ) -> str:
-#     bias = "neutral"
-#     if pcr is not None:
-#         bias = "bearish pressure" if pcr < 0.9 else ("bullish pressure" if pcr > 1.1 else "neutral")
-#     lines = [
-#         f"<b>NIFTY Weekly Watch</b> | Expiry {expiry}",
-#         f"Spot: {_fmt(spot)} | ATM: {_fmt(atm, 0)} | PCR: {_fmt(pcr)}",
-#         f"Bias: {bias}",
-#         f"Support: {_fmt(support, 0)} | Resistance: {_fmt(resistance, 0)} | Max Pain: {_fmt(max_pain, 0)}",
-#     ]
-#     if call_top:
-#         lines.append("Top Call OI: " + ", ".join(f"{s:g}({oi:.0f})" for s, oi in call_top))
-#     if put_top:
-#         lines.append("Top Put OI:  " + ", ".join(f"{s:g}({oi:.0f})" for s, oi in put_top))
-#     lines.append(f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>")
-#     return "\n".join(lines)
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-# # Agent
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# # Regex: matches CE23700, PE 23700, ce24550, pe 24550 etc.
-# STRIKE_RE = re.compile(r"^(CE|PE)\s*(\d{4,6})$", re.IGNORECASE)
-
-
-# class MarketWatchAgent:
-#     def __init__(self, cfg: Config):
-#         self.cfg    = cfg
-#         self.api    = DhanApiClient(cfg)
-#         self.bot    = TelegramBot(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.http_timeout)
-#         self.expiry: Optional[str] = None
-
-#     # ── expiry ────────────────────────────────────────────────────────────────
-
-#     def _pick_expiry(self) -> str:
-#         expiries = self.api.expiry_list()
-#         today    = datetime.now().date()
-#         future   = sorted(d for x in expiries if (d := _parse_date(x)) and d >= today)
-#         if not future:
-#             raise RuntimeError("No valid future expiry from Dhan.")
-#         return future[0].isoformat()
-
-#     def _ensure_expiry(self) -> str:
-#         if self.expiry is None:
-#             self.expiry = self._pick_expiry()
-#         return self.expiry
-
-#     # ── core fetch ────────────────────────────────────────────────────────────
-
-#     def _fetch_chain(self):
-#         expiry   = self._ensure_expiry()
-#         snapshot = self.api.option_chain(expiry)
-#         data     = snapshot.get("data", {})
-#         spot     = _num(data.get("last_price"))
-#         oc: Dict[str, Any] = data.get("oc") or {}
-#         if not oc:
-#             raise RuntimeError("Empty option chain — market may be closed.")
-#         return expiry, spot, oc
-
-#     # ── handlers ──────────────────────────────────────────────────────────────
-
-#     def _handle_strike(self, side: str, strike: float) -> None:
-#         """Main handler: CE23700 / PE23700"""
-#         expiry, spot, oc = self._fetch_chain()
-
-#         all_strikes         = sorted(float(k) for k in oc.keys())
-#         atm                 = _nearest_strike(all_strikes, spot)
-#         support, resistance = _support_resistance(oc)
-#         pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-#         max_pain_val        = _max_pain(oc)
-
-#         row         = _get_row(oc, strike)
-#         option_data = row.get(side.lower(), {})
-
-#         if not row:
-#             self.bot.send(
-#                 f"⚠️ Strike <b>{strike:,.0f}</b> not found in the option chain.\n"
-#                 f"Available strikes range: {all_strikes[0]:,.0f} – {all_strikes[-1]:,.0f}"
-#             )
-#             return
-
-#         msg = _build_strike_message(
-#             side=side,
-#             strike=strike,
-#             option_data=option_data,
-#             spot=spot,
-#             expiry=expiry,
-#             support=support,
-#             resistance=resistance,
-#             atm=atm,
-#             pcr=pcr_val,
-#             max_pain=max_pain_val,
-#         )
-#         self.bot.send(msg)
-
-#     def _handle_chain(self) -> None:
-#         expiry, spot, oc    = self._fetch_chain()
-#         all_strikes         = sorted(float(k) for k in oc.keys())
-#         atm                 = _nearest_strike(all_strikes, spot)
-#         rows                = _strikes_around_atm(oc, spot, self.cfg.strikes_window)
-#         support, resistance = _support_resistance(oc)
-#         pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-#         max_pain_val        = _max_pain(oc)
-#         self.bot.send(_build_chain_message(rows, spot, expiry, support, resistance, atm, pcr_val, max_pain_val))
-
-#     def _handle_status(self) -> None:
-#         expiry, spot, oc    = self._fetch_chain()
-#         all_strikes         = sorted(float(k) for k in oc.keys())
-#         atm                 = _nearest_strike(all_strikes, spot)
-#         support, resistance = _support_resistance(oc)
-#         pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-#         max_pain_val        = _max_pain(oc)
-#         call_top            = _top_oi(oc, "ce", 3)
-#         put_top             = _top_oi(oc, "pe", 3)
-#         self.bot.send(_build_status_message(spot, expiry, support, resistance, atm, pcr_val, max_pain_val, call_top, put_top))
-
-#     # ── dispatcher ────────────────────────────────────────────────────────────
-
-#     def _dispatch(self, raw: str) -> None:
-#         text = raw.strip()
-#         cmd  = text.split("@")[0].lower()
-
-#         # CE23700 / PE23700 pattern
-#         m = STRIKE_RE.match(text.replace(" ", ""))
-#         if m:
-#             side   = m.group(1).upper()
-#             strike = float(m.group(2))
-#             print(f"  Strike query: {side} {strike}")
-#             self._handle_strike(side, strike)
-#             return
-
-#         # Named commands
-#         if cmd in ("/chain", "chain"):
-#             self._handle_chain()
-#         elif cmd in ("/status", "status"):
-#             self._handle_status()
-#         elif cmd in ("/expiry", "expiry"):
-#             expiry = self._ensure_expiry()
-#             self.bot.send(f"Current weekly expiry: <b>{expiry}</b>")
-#         elif cmd in ("/help", "help", "/start", "start"):
-#             self.bot.send(HELP_TEXT)
-#         else:
-#             self.bot.send(f"Unknown command: <code>{text}</code>\n\n{HELP_TEXT}")
-
-#     # ── main loop ─────────────────────────────────────────────────────────────
-
-#     def run(self) -> None:
-#         print(f"Market Watch Agent started | {self.cfg.underlying_name_hint}")
-#         self.bot.send(f"<b>NIFTY Market Watch Bot is online!</b>\n\n{HELP_TEXT}")
-
-#         while True:
-#             try:
-#                 for msg in self.bot.get_messages():
-#                     print(f"Message: {msg}")
-#                     try:
-#                         self._dispatch(msg)
-#                     except Exception as e:
-#                         err = f"⚠️ Error: {e}"
-#                         print(err)
-#                         self.bot.send(err)
-
-#                 time.sleep(self.cfg.tg_poll_interval)
-
-#             except KeyboardInterrupt:
-#                 self.bot.send("NIFTY Market Watch Bot stopped.")
-#                 print("Stopped.")
-#                 return
-#             except requests.HTTPError as e:
-#                 print(f"HTTP error: {e}")
-#                 time.sleep(5)
-#             except Exception as e:
-#                 print(f"Error: {e}")
-#                 time.sleep(5)
-
-
-# # ─────────────────────────────────────────────────────────────────────────────
-
-# def main() -> None:
-#     cfg = Config.from_env()
-#     MarketWatchAgent(cfg).run()
-
-# if __name__ == "__main__":
-#     main()
+"""NIFTY50 signal bot with score-based BUY alerts.
+
+What this program does
+- NIFTY50 only
+- Live monitoring runs continuously in the background
+- Sends Telegram alerts only when a setup score is strong enough
+- SCAN YYYY-MM-DD YYYY-MM-DD runs a backtest on a date range
+- STOP cancels a running scan
+- LIVE enables live monitoring again
+- Uses IST timestamps
+- Keeps Telegram command style similar to your reference bot
+
+Scoring idea
+- Candlestick pattern confirmation (weighted by pattern strength)
+- VWAP alignment
+- Breakout / breakdown confirmation
+- Volume confirmation
+- Trend alignment
+- PCR confirmation
+- Candle body quality
+
+Important note
+- This is a signal assistant, not financial advice.
+- Backtest now fetches option chain per trading day for accurate strike/LTP data.
+"""
 
 from __future__ import annotations
 
 import dataclasses
+import datetime as dt
 import json
 import os
 import re
+import statistics
+import threading
 import time
-from datetime import datetime, timedelta, timezone
+from collections import Counter
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
+import numpy as np
+import pandas as pd
 import requests
 from dotenv import load_dotenv
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
-DHAN_BASE     = "https://api.dhan.co/v2"
+DHAN_BASE = "https://api.dhan.co/v2"
 TELEGRAM_BASE = "https://api.telegram.org"
+
+NIFTY50_SECURITY_ID = 13
+NIFTY50_SEGMENT = "IDX_I"
+NIFTY50_NAME = "NIFTY 50"
+IST = ZoneInfo("Asia/Kolkata")
+
+SCAN_RE = re.compile(r"^SCAN\s+(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})$", re.IGNORECASE)
+STOP_RE = re.compile(r"^STOP$", re.IGNORECASE)
+LIVE_RE = re.compile(r"^LIVE$", re.IGNORECASE)
+STRIKE_RE = re.compile(r"^(CE|PE)\s*(\d{4,6})$", re.IGNORECASE)
+
+# Score threshold for BUY alerts.
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+# Live polling interval in seconds. Keep >= 5 to stay comfortable with Dhan API rate limits.
+TG_POLL_INTERVAL_DEFAULT = float(os.getenv("TG_POLL_INTERVAL", "5"))
+# Volume confirmation threshold (e.g., 1.15 = 15% above average)
+VOLUME_THRESHOLD = float(os.getenv("VOLUME_THRESHOLD", "1.15"))
+# Minimum seconds between signals for the same direction
+SIGNAL_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_COOLDOWN_SECONDS", "300"))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclasses.dataclass
+
+@dataclass
 class Config:
     dhan_client_id: str
     dhan_access_token: str
     telegram_bot_token: str
     telegram_chat_id: str
-    underlying_security_id: int = 13
-    underlying_segment: str = "IDX_I"
-    underlying_name_hint: str = "NIFTY 50"
-    strikes_window: int = 5
     http_timeout: int = 15
-    tg_poll_interval: float = 1.5
+    tg_poll_interval: float = TG_POLL_INTERVAL_DEFAULT
+    strikes_window: int = 5
 
     @staticmethod
     def from_env() -> "Config":
         required = {
-            "DHAN_CLIENT_ID":     os.getenv("DHAN_CLIENT_ID", "").strip(),
-            "DHAN_ACCESS_TOKEN":  os.getenv("DHAN_ACCESS_TOKEN", "").strip(),
+            "DHAN_CLIENT_ID": os.getenv("DHAN_CLIENT_ID", "").strip(),
+            "DHAN_ACCESS_TOKEN": os.getenv("DHAN_ACCESS_TOKEN", "").strip(),
             "TELEGRAM_BOT_TOKEN": os.getenv("TELEGRAM_BOT_TOKEN", "").strip(),
-            "TELEGRAM_CHAT_ID":   os.getenv("TELEGRAM_CHAT_ID", "").strip(),
+            "TELEGRAM_CHAT_ID": os.getenv("TELEGRAM_CHAT_ID", "").strip(),
         }
         missing = [k for k, v in required.items() if not v]
         if missing:
             raise SystemExit("Missing env vars: " + ", ".join(missing))
 
-        def _int(n: str, d: int) -> int:
-            try: return int(os.getenv(n, str(d)).strip())
-            except ValueError: return d
+        def _int(name: str, default: int) -> int:
+            try:
+                return int(os.getenv(name, str(default)).strip())
+            except Exception:
+                return default
 
-        def _float(n: str, d: float) -> float:
-            try: return float(os.getenv(n, str(d)).strip())
-            except ValueError: return d
+        def _float(name: str, default: float) -> float:
+            try:
+                return float(os.getenv(name, str(default)).strip())
+            except Exception:
+                return default
 
         return Config(
             dhan_client_id=required["DHAN_CLIENT_ID"],
             dhan_access_token=required["DHAN_ACCESS_TOKEN"],
             telegram_bot_token=required["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=required["TELEGRAM_CHAT_ID"],
-            underlying_security_id=_int("DHAN_UNDERLYING_SECURITY_ID", 13),
-            underlying_segment=os.getenv("DHAN_UNDERLYING_SEGMENT", "IDX_I").strip(),
-            underlying_name_hint=os.getenv("UNDERLYING_NAME_HINT", "NIFTY 50").strip(),
-            strikes_window=_int("STRIKES_WINDOW", 5),
             http_timeout=_int("HTTP_TIMEOUT", 15),
-            tg_poll_interval=_float("TG_POLL_INTERVAL", 1.5),
+            tg_poll_interval=_float("TG_POLL_INTERVAL", TG_POLL_INTERVAL_DEFAULT),
+            strikes_window=_int("STRIKES_WINDOW", 5),
         )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Candle dataclass
+# Data models
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclasses.dataclass
+
+@dataclass
 class Candle:
-    ts: datetime
+    ts: dt.datetime
     open: float
     high: float
     low: float
@@ -711,40 +134,125 @@ class Candle:
     volume: float
 
 
+@dataclass
+class IntradayContext:
+    day_open: float
+    day_high: float
+    day_low: float
+    last_close: float
+    vwap: float
+    trend: str
+    candle_count: int
+    last_candle: Candle
+    intraday_support: float
+    intraday_resistance: float
+    prev_candle_high: float
+    prev_candle_low: float
+    recent_avg_volume: float
+
+
+@dataclass
+class OptionTradePlan:
+    side: str
+    strike: float
+    option_security_id: Optional[int]
+    option_ltp: float
+    entry: float
+    stop_loss: float
+    target1: float
+    target2: float
+    risk: float
+    reward1: float
+    reward2: float
+    rr1: float
+    rr2: float
+
+
+@dataclass
+class Signal:
+    timestamp: str
+    underlying_symbol: str
+    candle_time: str
+    direction: str
+    score: int
+    max_score: int
+    pattern_names: List[str]
+    reasons: List[str]
+    vwap: float
+    spot: float
+    pcr: Optional[float]
+    support: Optional[float]
+    resistance: Optional[float]
+    option_plan: OptionTradePlan
+    confidence: str
+
+    def to_json(self) -> str:
+        payload = dataclasses.asdict(self)
+        return json.dumps(payload, indent=2, default=str)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Dhan API
+# API clients
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class DhanApiClient:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.session = requests.Session()
-        self.session.headers.update({
-            "Content-Type": "application/json",
-            "access-token": cfg.dhan_access_token,
-            "client-id":    cfg.dhan_client_id,
-        })
+        self.session.headers.update(
+            {
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+                "access-token": cfg.dhan_access_token,
+                "client-id": cfg.dhan_client_id,
+            }
+        )
 
     def expiry_list(self) -> List[str]:
+        payload = {
+            "UnderlyingScrip": NIFTY50_SECURITY_ID,
+            "UnderlyingSeg": NIFTY50_SEGMENT,
+        }
         r = self.session.post(
             f"{DHAN_BASE}/optionchain/expirylist",
-            data=json.dumps({
-                "UnderlyingScrip": self.cfg.underlying_security_id,
-                "UnderlyingSeg":   self.cfg.underlying_segment,
-            }),
+            data=json.dumps(payload),
             timeout=self.cfg.http_timeout,
         )
         r.raise_for_status()
         return [str(x) for x in r.json().get("data", [])]
 
+    def pick_expiry(self) -> str:
+        expiries = self.expiry_list()
+        if not expiries:
+            raise RuntimeError("No expiry dates returned by Dhan.")
+
+        today = dt.date.today()
+
+        def parse_expiry(x: str) -> dt.date:
+            for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
+                try:
+                    return dt.datetime.strptime(x, fmt).date()
+                except Exception:
+                    continue
+            return dt.date.max
+
+        future = sorted(expiries, key=parse_expiry)
+        for exp in future:
+            d = parse_expiry(exp)
+            if d >= today or d == dt.date.max:
+                return exp
+        return future[0]
+
     def option_chain(self, expiry: str) -> Dict[str, Any]:
+        payload = {
+            "UnderlyingScrip": NIFTY50_SECURITY_ID,
+            "UnderlyingSeg": NIFTY50_SEGMENT,
+            "Expiry": expiry,
+        }
         r = self.session.post(
             f"{DHAN_BASE}/optionchain",
-            data=json.dumps({
-                "UnderlyingScrip": self.cfg.underlying_security_id,
-                "UnderlyingSeg":   self.cfg.underlying_segment,
-                "Expiry":          expiry,
-            }),
+            data=json.dumps(payload),
             timeout=self.cfg.http_timeout,
         )
         r.raise_for_status()
@@ -755,20 +263,19 @@ class DhanApiClient:
         security_id: int,
         exchange_segment: str,
         instrument: str,
-        interval: int = 5,
-    ) -> List[Candle]:
-        """Fetch today's intraday 5-min candles for a security."""
-        now      = datetime.now()
-        today    = now.strftime("%Y-%m-%d")
-        # Dhan needs fromDate/toDate as date strings or datetime strings
-        payload  = {
-            "securityId":      str(security_id),
+        interval: int,
+        from_date: str,
+        to_date: str,
+        oi: bool = True,
+    ) -> pd.DataFrame:
+        payload = {
+            "securityId": str(security_id),
             "exchangeSegment": exchange_segment,
-            "instrument":      instrument,
-            "interval":        str(interval),
-            "oi":              False,
-            "fromDate":        today,
-            "toDate":          today,
+            "instrument": instrument,
+            "interval": str(interval),
+            "oi": bool(oi),
+            "fromDate": from_date,
+            "toDate": to_date,
         }
         r = self.session.post(
             f"{DHAN_BASE}/charts/intraday",
@@ -777,50 +284,74 @@ class DhanApiClient:
         )
         r.raise_for_status()
         raw = r.json()
+        if isinstance(raw, dict) and "data" in raw:
+            raw = raw["data"]
+        if isinstance(raw, list):
+            return self._rows_to_df(raw)
+        if isinstance(raw, dict):
+            return self._dict_to_df(raw)
+        raise ValueError(f"Unexpected intraday response shape: {type(raw)}")
 
-        opens  = raw.get("open",      [])
-        highs  = raw.get("high",      [])
-        lows   = raw.get("low",       [])
-        closes = raw.get("close",     [])
-        vols   = raw.get("volume",    [])
-        tss    = raw.get("timestamp", [])
+    @staticmethod
+    def _rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
+        df = pd.DataFrame(rows)
+        return DhanApiClient._normalize_df(df)
 
-        candles: List[Candle] = []
-        for i in range(min(len(opens), len(highs), len(lows), len(closes), len(vols), len(tss))):
-            try:
-                candles.append(Candle(
-                    ts=datetime.fromtimestamp(float(tss[i]), tz=timezone.utc).astimezone(),
-                    open=float(opens[i]),
-                    high=float(highs[i]),
-                    low=float(lows[i]),
-                    close=float(closes[i]),
-                    volume=float(vols[i]),
-                ))
-            except Exception:
-                continue
-        return candles
+    @staticmethod
+    def _dict_to_df(data: Dict[str, Any]) -> pd.DataFrame:
+        keys = {k.lower(): k for k in data.keys()}
+        required = ["open", "high", "low", "close", "volume", "timestamp"]
+        missing = [k for k in required if k not in keys]
+        if missing:
+            raise ValueError(f"Intraday response missing keys: {missing}; got {list(data.keys())}")
 
-    def intraday_option_candles(
-        self,
-        security_id: int,
-        interval: int = 5,
-    ) -> List[Candle]:
-        """Fetch intraday candles for an option contract (NSE FO segment)."""
-        return self.intraday_candles(
-            security_id=security_id,
-            exchange_segment="NSE_FNO",
-            instrument="OPTIDX",
-            interval=interval,
+        df = pd.DataFrame(
+            {
+                "timestamp": data[keys["timestamp"]],
+                "open": data[keys["open"]],
+                "high": data[keys["high"]],
+                "low": data[keys["low"]],
+                "close": data[keys["close"]],
+                "volume": data[keys["volume"]],
+            }
         )
+        if "open_interest" in keys:
+            df["open_interest"] = data[keys["open_interest"]]
+        return DhanApiClient._normalize_df(df)
 
+    @staticmethod
+    def _normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+        df = df.copy()
+        if "timestamp" not in df.columns:
+            raise ValueError("Intraday data has no timestamp column.")
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Telegram bot
-# ─────────────────────────────────────────────────────────────────────────────
+        ts = pd.to_numeric(df["timestamp"], errors="coerce")
+        if ts.notna().any():
+            df["timestamp"] = (
+                pd.to_datetime(ts, unit="s", utc=True)
+                .dt.tz_convert(IST)
+                .dt.tz_localize(None)
+            )
+        else:
+            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+            if getattr(df["timestamp"].dt, "tz", None) is not None:
+                df["timestamp"] = df["timestamp"].dt.tz_convert(IST).dt.tz_localize(None)
+
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+        if "open_interest" not in df.columns:
+            df["open_interest"] = np.nan
+        else:
+            df["open_interest"] = pd.to_numeric(df["open_interest"], errors="coerce")
+
+        df = df.dropna(subset=["timestamp", "open", "high", "low", "close", "volume"]).sort_values("timestamp")
+        return df.reset_index(drop=True)
+
 
 class TelegramBot:
     def __init__(self, token: str, chat_id: str, timeout: int = 15):
-        self.token   = token
+        self.token = token
         self.chat_id = str(chat_id)
         self.timeout = timeout
         self.session = requests.Session()
@@ -830,9 +361,9 @@ class TelegramBot:
         self.session.post(
             f"{TELEGRAM_BASE}/bot{self.token}/sendMessage",
             data={
-                "chat_id":                  self.chat_id,
-                "text":                     text,
-                "parse_mode":               "HTML",
+                "chat_id": self.chat_id,
+                "text": text,
+                "parse_mode": "HTML",
                 "disable_web_page_preview": True,
             },
             timeout=self.timeout,
@@ -852,33 +383,142 @@ class TelegramBot:
         texts: List[str] = []
         for update in r.json().get("result", []):
             self._offset = update["update_id"] + 1
-            msg     = update.get("message") or update.get("channel_post") or {}
+            msg = update.get("message") or update.get("channel_post") or {}
             chat_id = str((msg.get("chat") or {}).get("id", ""))
-            text    = (msg.get("text") or "").strip()
+            text = (msg.get("text") or "").strip()
             if chat_id == self.chat_id and text:
                 texts.append(text)
         return texts
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Helpers
+# Utility helpers
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _num(v: Any, default: float = 0.0) -> float:
-    try:   return float(v) if v is not None else default
-    except Exception: return default
+    try:
+        return float(v) if v is not None else default
+    except Exception:
+        return default
+
 
 def _fmt(v: Any, decimals: int = 2) -> str:
     return "—" if v is None else f"{float(v):,.{decimals}f}"
 
-def _nearest_strike(strikes: List[float], spot: float) -> float:
-    return min(strikes, key=lambda s: abs(s - spot))
 
-def _parse_date(s: str):
-    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
-        try:   return datetime.strptime(s, fmt).date()
-        except Exception: continue
-    return None
+def _today_ist() -> dt.date:
+    return dt.datetime.now(IST).date()
+
+
+def _now_ist() -> dt.datetime:
+    return dt.datetime.now(IST)
+
+
+def _market_session_open(now: Optional[dt.datetime] = None) -> bool:
+    now = now or _now_ist()
+    if now.weekday() >= 5:
+        return False
+    t = now.time()
+    return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+
+def _is_market_hours(ts: dt.datetime) -> bool:
+    """Check if timestamp falls within market hours (9:15-15:30) on a weekday."""
+    if ts.weekday() >= 5:
+        return False
+    t = ts.time()
+    return dt.time(9, 15) <= t <= dt.time(15, 30)
+
+
+def _nearest_strike(strikes: List[float], spot: float) -> float:
+    return min(strikes, key=lambda s: abs(s - spot)) if strikes else 0.0
+
+
+def _infer_step(strikes: List[float]) -> int:
+    """Infer strike step using mode of differences (more robust than median)."""
+    if len(strikes) < 2:
+        return 50
+    diffs = [abs(b - a) for a, b in zip(strikes[:-1], strikes[1:]) if abs(b - a) > 0]
+    if not diffs:
+        return 50
+    counter = Counter(int(round(d)) for d in diffs)
+    mode_step = counter.most_common(1)[0][0]
+    return mode_step if mode_step > 0 else 50
+
+
+def _support_resistance_oi(oc: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
+    support = None
+    resistance = None
+    best_pe = -1.0
+    best_ce = -1.0
+    for k, row in oc.items():
+        try:
+            strike = float(k)
+        except Exception:
+            continue
+        pe_oi = _num((row.get("pe") or {}).get("oi"))
+        ce_oi = _num((row.get("ce") or {}).get("oi"))
+        if pe_oi > best_pe:
+            best_pe = pe_oi
+            support = strike
+        if ce_oi > best_ce:
+            best_ce = ce_oi
+            resistance = strike
+    return support, resistance
+
+
+def _pcr(oc: Dict[str, Any], center: float, window: int) -> Optional[float]:
+    strikes = sorted(float(k) for k in oc.keys())
+    if not strikes:
+        return None
+    band = sorted(strikes, key=lambda s: abs(s - center))[: max(2, window * 2)]
+    call_oi = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")) for s in band)
+    put_oi = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")) for s in band)
+    return (put_oi / call_oi) if call_oi > 0 else None
+
+
+def compute_pcr_from_chain(chain_json: Dict[str, Any]) -> Optional[float]:
+    """Return overall PCR from the full option-chain snapshot."""
+    try:
+        data = chain_json.get("data", chain_json)
+        oc: Dict[str, Any] = data.get("oc") or {}
+        if not oc:
+            return None
+
+        ce_oi = 0.0
+        pe_oi = 0.0
+        for row in oc.values():
+            ce_oi += _num((row.get("ce") or {}).get("oi"))
+            pe_oi += _num((row.get("pe") or {}).get("oi"))
+
+        if ce_oi <= 0:
+            return None
+        return pe_oi / ce_oi
+    except Exception:
+        return None
+
+
+def _max_pain(oc: Dict[str, Any]) -> Optional[float]:
+    strikes = sorted(float(k) for k in oc.keys())
+    if not strikes:
+        return None
+    oi_map = {
+        s: (
+            _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")),
+            _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")),
+        )
+        for s in strikes
+    }
+    best = None
+    best_pain = None
+    for settle in strikes:
+        pain = sum(max(0.0, settle - s) * ce + max(0.0, s - settle) * pe for s, (ce, pe) in oi_map.items())
+        if best_pain is None or pain < best_pain:
+            best_pain = pain
+            best = settle
+    return best
+
 
 def _get_row(oc: Dict[str, Any], strike: float) -> Dict[str, Any]:
     return (
@@ -889,102 +529,62 @@ def _get_row(oc: Dict[str, Any], strike: float) -> Dict[str, Any]:
         or {}
     )
 
-def _support_resistance_oi(oc: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
-    best_pe, support    = -1.0, None
-    best_ce, resistance = -1.0, None
-    for k, row in oc.items():
-        try:   strike = float(k)
-        except Exception: continue
-        pe_oi = _num(row.get("pe", {}).get("oi"))
-        ce_oi = _num(row.get("ce", {}).get("oi"))
-        if pe_oi > best_pe: best_pe, support    = pe_oi, strike
-        if ce_oi > best_ce: best_ce, resistance = ce_oi, strike
-    return support, resistance
-
-def _pcr(oc: Dict[str, Any], center: float, window: int) -> Optional[float]:
-    strikes = sorted(float(k) for k in oc.keys())
-    band    = sorted(strikes, key=lambda s: abs(s - center))[: max(2, window * 2)]
-    call_oi = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")) for s in band)
-    put_oi  = sum(_num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")) for s in band)
-    return (put_oi / call_oi) if call_oi > 0 else None
-
-def _max_pain(oc: Dict[str, Any]) -> Optional[float]:
-    strikes = sorted(float(k) for k in oc.keys())
-    if not strikes: return None
-    oi_map = {
-        s: (
-            _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("ce", {}).get("oi")),
-            _num((oc.get(f"{s:.6f}") or oc.get(str(s)) or {}).get("pe", {}).get("oi")),
-        )
-        for s in strikes
-    }
-    best, best_pain = None, None
-    for settle in strikes:
-        pain = sum(max(0.0, settle - s) * ce + max(0.0, s - settle) * pe
-                   for s, (ce, pe) in oi_map.items())
-        if best_pain is None or pain < best_pain:
-            best_pain, best = pain, settle
-    return best
 
 def _top_oi(oc: Dict[str, Any], side: str, n: int = 3) -> List[Tuple[float, float]]:
-    items = []
+    items: List[Tuple[float, float]] = []
     for k, v in oc.items():
-        try:   items.append((float(k), _num(v.get(side, {}).get("oi"))))
-        except Exception: continue
+        try:
+            items.append((float(k), _num(v.get(side, {}).get("oi"))))
+        except Exception:
+            continue
     return sorted(items, key=lambda x: x[1], reverse=True)[:n]
 
-def _strikes_around_atm(
-    oc: Dict[str, Any], spot: float, window: int
-) -> List[Tuple[float, Dict[str, Any]]]:
+
+def _strikes_around_atm(oc: Dict[str, Any], spot: float, window: int) -> List[Tuple[float, Dict[str, Any]]]:
     all_strikes = sorted(float(k) for k in oc.keys())
-    if not all_strikes: return []
-    atm    = _nearest_strike(all_strikes, spot)
+    if not all_strikes:
+        return []
+    atm = _nearest_strike(all_strikes, spot)
     nearby = sorted(all_strikes, key=lambda s: abs(s - atm))[: window * 2 + 1]
     return [(s, oc.get(f"{s:.6f}") or oc.get(str(s)) or {}) for s in sorted(nearby)]
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Intraday analytics
-# ─────────────────────────────────────────────────────────────────────────────
-
-@dataclasses.dataclass
-class IntradayLevels:
-    day_open:   float
-    day_high:   float
-    day_low:    float
-    last_close: float          # last candle close = current price proxy
-    vwap:       float
-    trend:      str            # "uptrend" | "downtrend" | "sideways"
-    candle_count: int
-    last_candle: Optional[Candle]
-
-    # derived support / resistance from candles
-    intraday_support:    float
-    intraday_resistance: float
-
-    # key price levels
-    prev_candle_high: float
-    prev_candle_low:  float
-
-
 def _calc_vwap(candles: List[Candle]) -> float:
-    """VWAP = sum(typical_price * volume) / sum(volume)"""
     num = sum(((c.high + c.low + c.close) / 3.0) * c.volume for c in candles)
     den = sum(c.volume for c in candles)
     return (num / den) if den > 0 else 0.0
 
 
-def _analyse_intraday(candles: List[Candle]) -> Optional[IntradayLevels]:
+def _filter_candles_for_day(candles: List[Candle], target_date: dt.date) -> List[Candle]:
+    """Filter candles to only include those from a specific trading day."""
+    return [c for c in candles if c.ts.date() == target_date]
+
+
+def _analyse_intraday(candles: List[Candle], single_day: bool = True) -> Optional[IntradayContext]:
+    """
+    Analyze intraday candles.
+
+    If single_day=True, assumes all candles are from the same trading day.
+    If single_day=False, filters to only use candles from the last candle's date
+    for VWAP and day stats calculation.
+    """
     if not candles:
         return None
 
-    day_open   = candles[0].open
-    day_high   = max(c.high   for c in candles)
-    day_low    = min(c.low    for c in candles)
-    last_close = candles[-1].close
-    vwap       = _calc_vwap(candles)
+    if not single_day:
+        last_date = candles[-1].ts.date()
+        day_candles = _filter_candles_for_day(candles, last_date)
+        if not day_candles:
+            day_candles = candles
+    else:
+        day_candles = candles
 
-    # Simple trend: compare last close vs open and vs VWAP
+    day_open = day_candles[0].open
+    day_high = max(c.high for c in day_candles)
+    day_low = min(c.low for c in day_candles)
+    last_close = candles[-1].close
+    vwap = _calc_vwap(day_candles)
+
     if last_close > vwap and last_close > day_open:
         trend = "uptrend"
     elif last_close < vwap and last_close < day_open:
@@ -992,15 +592,21 @@ def _analyse_intraday(candles: List[Candle]) -> Optional[IntradayLevels]:
     else:
         trend = "sideways"
 
-    # Intraday support  = lowest low of last 6 candles (≈30 min)
-    # Intraday resistance = highest high of last 6 candles
+    # Exclude current candle from recent average volume calculation
+    if len(candles) >= 7:
+        recent_for_vol = candles[-7:-1]
+    elif len(candles) >= 2:
+        recent_for_vol = candles[:-1]
+    else:
+        recent_for_vol = candles
+
     recent = candles[-6:] if len(candles) >= 6 else candles
-    intraday_support    = min(c.low  for c in recent)
+    intraday_support = min(c.low for c in recent)
     intraday_resistance = max(c.high for c in recent)
-
     prev_candle = candles[-2] if len(candles) >= 2 else candles[-1]
+    recent_avg_volume = float(sum(c.volume for c in recent_for_vol) / max(len(recent_for_vol), 1))
 
-    return IntradayLevels(
+    return IntradayContext(
         day_open=day_open,
         day_high=day_high,
         day_low=day_low,
@@ -1013,251 +619,435 @@ def _analyse_intraday(candles: List[Candle]) -> Optional[IntradayLevels]:
         intraday_resistance=intraday_resistance,
         prev_candle_high=prev_candle.high,
         prev_candle_low=prev_candle.low,
+        recent_avg_volume=recent_avg_volume,
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Intraday trade levels
+# Candlestick patterns with strength weights
 # ─────────────────────────────────────────────────────────────────────────────
 
-@dataclasses.dataclass
-class TradeLevels:
-    buy:        float
-    target1:    float   # conservative  (+1 R)
-    target2:    float   # aggressive    (+2 R)
-    stop_loss:  float
-    risk:       float
-    reward1:    float
-    reward2:    float
-    rr1:        float
-    rr2:        float
-    note:       str
+# Pattern strength: higher = stronger signal
+BULLISH_PATTERN_WEIGHTS = {
+    "CDL3WHITESOLDIERS": 3,
+    "CDLMORNINGSTAR": 3,
+    "CDLMORNINGDOJISTAR": 3,
+    "CDLENGULFING": 2,
+    "CDLPIERCING": 2,
+    "CDLHAMMER": 1,
+    "CDLINVERTEDHAMMER": 1,
+    "CDLTAKURI": 1,
+    "CDLDRAGONFLYDOJI": 1,
+}
+
+BEARISH_PATTERN_WEIGHTS = {
+    "CDL3BLACKCROWS": 3,
+    "CDLEVENINGSTAR": 3,
+    "CDLEVENINGDOJISTAR": 3,
+    "CDLENGULFING": 2,
+    "CDLDARKCLOUDCOVER": 2,
+    "CDLSHOOTINGSTAR": 1,
+    "CDLHANGINGMAN": 1,
+    "CDLGRAVESTONEDOJI": 1,
+    "CDLADVANCEBLOCK": 1,
+}
+
+BULLISH_PATTERNS = set(BULLISH_PATTERN_WEIGHTS.keys())
+BEARISH_PATTERNS = set(BEARISH_PATTERN_WEIGHTS.keys())
 
 
-def _intraday_trade_levels(
-    side: str,               # "CE" or "PE"
-    ltp: float,
-    il: IntradayLevels,
-    oi_support: Optional[float],
-    oi_resistance: Optional[float],
+def _pattern_function_names() -> List[str]:
+    try:
+        import talib  # type: ignore
+
+        return sorted([n for n in dir(talib) if n.startswith("CDL") and callable(getattr(talib, n))])
+    except Exception:
+        return []
+
+
+def detect_patterns(df: pd.DataFrame) -> List[str]:
+    if len(df) < 5:
+        return []
+
+    try:
+        import talib  # type: ignore
+
+        open_ = df["open"].astype(float).to_numpy()
+        high = df["high"].astype(float).to_numpy()
+        low = df["low"].astype(float).to_numpy()
+        close = df["close"].astype(float).to_numpy()
+
+        matches: List[str] = []
+        for name in _pattern_function_names():
+            fn = getattr(talib, name)
+            try:
+                out = fn(open_, high, low, close)
+                if len(out) and int(out[-1]) != 0:
+                    matches.append(name)
+            except Exception:
+                continue
+        return matches
+    except Exception:
+        # Minimal fallback if TA-Lib is not installed.
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        body = abs(last.close - last.open)
+        rng = max(last.high - last.low, 1e-9)
+        upper = last.high - max(last.open, last.close)
+        lower = min(last.open, last.close) - last.low
+        matches: List[str] = []
+
+        if lower >= 2 * body and upper <= body * 0.3:
+            matches.append("CDLHAMMER")
+        if upper >= 2 * body and lower <= body * 0.3:
+            matches.append("CDLSHOOTINGSTAR")
+        if last.close > last.open and prev.close < prev.open and last.close >= prev.open and last.open <= prev.close:
+            matches.append("CDLENGULFING")
+        if last.close < last.open and prev.close > prev.open and last.open >= prev.close and last.close <= prev.open:
+            matches.append("CDLENGULFING")
+        if body / rng <= 0.1:
+            matches.append("CDLDOJI")
+        return matches
+
+
+def infer_direction(patterns: List[str]) -> Tuple[str, int, int]:
+    """
+    Return (direction, bullish_score, bearish_score).
+    Uses weighted scoring instead of simple count.
+    Returns NEUTRAL if scores are too close (within 1 point) or both zero.
+    """
+    bullish_score = sum(BULLISH_PATTERN_WEIGHTS.get(p, 0) for p in patterns if p in BULLISH_PATTERNS)
+    bearish_score = sum(BEARISH_PATTERN_WEIGHTS.get(p, 0) for p in patterns if p in BEARISH_PATTERNS)
+
+    # Require at least 2 points difference to avoid MIXED signals
+    if bullish_score == 0 and bearish_score == 0:
+        return "NEUTRAL", 0, 0
+    if abs(bullish_score - bearish_score) < 2:
+        return "NEUTRAL", bullish_score, bearish_score
+    if bullish_score > bearish_score:
+        return "BULLISH", bullish_score, bearish_score
+    return "BEARISH", bullish_score, bearish_score
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Scoring + trade planning
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def score_setup(
+    candles: pd.DataFrame,
+    chain: Dict[str, Any],
+    ctx: IntradayContext,
+    patterns: List[str],
+) -> Tuple[str, int, int, List[str]]:
+    """Return (direction, score, max_score, reasons)."""
+    max_score = 11
+    reasons: List[str] = []
+
+    direction, bullish_weight, bearish_weight = infer_direction(patterns)
+    if direction == "NEUTRAL":
+        return direction, 0, max_score, reasons
+
+    bullish = direction == "BULLISH"
+    last = candles.iloc[-1]
+    prev = candles.iloc[-2] if len(candles) >= 2 else candles.iloc[-1]
+
+    score = 0
+
+    # 1) Pattern confirmation with weighted scoring (max 3 points)
+    pattern_weight = bullish_weight if bullish else bearish_weight
+    side_patterns = [p for p in patterns if (p in BULLISH_PATTERNS if bullish else p in BEARISH_PATTERNS)]
+    if side_patterns:
+        # Scale: weight 1-2 = 1pt, 3-4 = 2pts, 5+ = 3pts
+        if pattern_weight >= 5:
+            pattern_score = 3
+        elif pattern_weight >= 3:
+            pattern_score = 2
+        else:
+            pattern_score = 1
+        score += pattern_score
+        reasons.append(f"Pattern confirmation: {', '.join(side_patterns[:3])} (strength {pattern_weight})")
+
+    # 2) VWAP alignment
+    if bullish and last.close > ctx.vwap:
+        score += 2
+        reasons.append("Price above VWAP")
+    elif (not bullish) and last.close < ctx.vwap:
+        score += 2
+        reasons.append("Price below VWAP")
+
+    # 3) Breakout / breakdown confirmation
+    if bullish and last.close > prev.high:
+        score += 2
+        reasons.append("Close above previous high")
+    elif (not bullish) and last.close < prev.low:
+        score += 2
+        reasons.append("Close below previous low")
+
+    # 4) Volume confirmation (uses configurable threshold)
+    if ctx.recent_avg_volume > 0 and last.volume >= ctx.recent_avg_volume * VOLUME_THRESHOLD:
+        score += 1
+        reasons.append(f"Volume {last.volume/ctx.recent_avg_volume:.0%} of recent avg")
+
+    # 5) Trend alignment
+    if bullish and ctx.trend == "uptrend":
+        score += 1
+        reasons.append("Trend aligned to upside")
+    elif (not bullish) and ctx.trend == "downtrend":
+        score += 1
+        reasons.append("Trend aligned to downside")
+
+    # 6) Candle quality
+    candle_range = max(last.high - last.low, 1e-9)
+    body = abs(last.close - last.open)
+    body_ratio = body / candle_range
+    if body_ratio >= 0.55:
+        score += 1
+        reasons.append("Strong candle body")
+
+    # 7) PCR confirmation
+    pcr = compute_pcr_from_chain(chain)
+    if bullish and pcr is not None and pcr > 1.05:
+        score += 1
+        reasons.append(f"PCR bullish ({pcr:.2f})")
+    elif (not bullish) and pcr is not None and pcr < 0.95:
+        score += 1
+        reasons.append(f"PCR bearish ({pcr:.2f})")
+
+    return direction, min(score, max_score), max_score, reasons
+
+
+def _signal_confidence(score: int, max_score: int) -> str:
+    pct = (score / max_score) * 100 if max_score > 0 else 0
+    if pct >= 85:
+        return "Strong"
+    if pct >= 70:
+        return "Good"
+    return "Weak"
+
+
+def _choose_strike(spot: float, strikes: List[float], side: str, score: int) -> float:
+    """Choose ATM or slightly ITM for stronger scores."""
+    if not strikes:
+        return round(spot / 50.0) * 50
+
+    step = _infer_step(strikes)
+    atm = _nearest_strike(strikes, spot)
+
+    if score >= 10:
+        if side == "CE":
+            target = atm - step
+            candidates = [s for s in strikes if s <= target]
+            return max(candidates) if candidates else atm
+        else:
+            target = atm + step
+            candidates = [s for s in strikes if s >= target]
+            return min(candidates) if candidates else atm
+
+    return atm
+
+
+def _option_trade_plan(
+    chain: Dict[str, Any],
     spot: float,
-) -> TradeLevels:
-    """
-    Intraday trade level logic
-    ──────────────────────────
-    Entry (buy price):
-        CE → buy near VWAP if price > VWAP (bullish), else near intraday support
-        PE → buy near VWAP if price < VWAP (bearish), else near intraday resistance
-
-    Stop Loss:
-        CE → below the lower of: prev candle low OR intraday support (in option price terms → 20% of LTP)
-        PE → above the higher of: prev candle high OR intraday resistance
-
-        We translate the underlying SL buffer into option price % move:
-            SL = LTP * (1 - sl_pct)  where sl_pct is 15-25% depending on trend
-
-    Target:
-        T1 = entry + 1× risk  (1:1 R:R)
-        T2 = entry + 2× risk  (1:2 R:R)
-
-    Context adjustments:
-        - Trend aligned  → sl_pct = 15% (tighter SL, higher confidence)
-        - Counter-trend  → sl_pct = 25% (wider SL, lower confidence)
-        - Sideways       → sl_pct = 20%
-    """
-    # Trend alignment check
-    if side == "CE":
-        aligned = il.trend == "uptrend"
-        against = il.trend == "downtrend"
-    else:
-        aligned = il.trend == "downtrend"
-        against = il.trend == "uptrend"
-
-    if aligned:
-        sl_pct = 0.15
-        note   = f"✅ Trade is trend-aligned ({il.trend}). Tighter SL used."
-    elif against:
-        sl_pct = 0.25
-        note   = f"⚠️ Trade is counter-trend ({il.trend}). Wider SL used. Trade with caution."
-    else:
-        sl_pct = 0.20
-        note   = f"➡️ Market is sideways. Standard SL used."
-
-    # Entry = LTP (market order)
-    buy       = round(ltp, 2)
-    stop_loss = round(max(ltp * (1 - sl_pct), 1.0), 2)   # floor ₹1
-    risk      = round(buy - stop_loss, 2)
-
-    target1 = round(buy + risk * 1.0, 2)   # 1:1
-    target2 = round(buy + risk * 2.0, 2)   # 1:2
-
-    reward1 = round(target1 - buy, 2)
-    reward2 = round(target2 - buy, 2)
-    rr1     = round(reward1 / risk, 1) if risk > 0 else 0.0
-    rr2     = round(reward2 / risk, 1) if risk > 0 else 0.0
-
-    return TradeLevels(
-        buy=buy, target1=target1, target2=target2,
-        stop_loss=stop_loss, risk=risk,
-        reward1=reward1, reward2=reward2,
-        rr1=rr1, rr2=rr2, note=note,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Message builder — strike analysis (intraday)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_strike_message(
     side: str,
-    strike: float,
-    option_data: Dict[str, Any],
-    spot: float,
-    expiry: str,
-    oi_support: Optional[float],
-    oi_resistance: Optional[float],
-    atm: float,
-    pcr: Optional[float],
-    max_pain: Optional[float],
-    il: Optional[IntradayLevels],
-) -> str:
-    ltp        = _num(option_data.get("last_price"))
-    prev_close = _num(option_data.get("previous_close_price"))
-    oi         = _num(option_data.get("oi"))
-    prev_oi    = _num(option_data.get("previous_oi"))
-    volume     = _num(option_data.get("volume"))
-    iv         = _num(option_data.get("implied_volatility"))
-    bid        = _num(option_data.get("bid_price"))
-    ask        = _num(option_data.get("ask_price"))
+    score: int,
+) -> Tuple[float, Optional[int], float, OptionTradePlan]:
+    data = chain.get("data", chain)
+    oc: Dict[str, Any] = data.get("oc") or {}
+    strikes = sorted(float(k) for k in oc.keys())
+    strike = _choose_strike(spot, strikes, side, score)
+    key = min(oc.keys(), key=lambda k: abs(float(k) - strike))
+    row = oc.get(key) or {}
+    opt = row.get("ce" if side == "CE" else "pe") or {}
 
-    oi_change   = oi - prev_oi
-    price_chg   = ltp - prev_close
-    price_chg_p = (price_chg / prev_close * 100) if prev_close > 0 else 0.0
+    option_security_id = opt.get("security_id")
+    option_ltp = _num(opt.get("last_price"), default=0.0)
+    if option_ltp <= 0:
+        option_ltp = max(1.0, round(abs(spot - strike) / 4.0, 2))
 
-    bias = "neutral"
-    if pcr is not None:
-        bias = "bearish" if pcr < 0.9 else ("bullish" if pcr > 1.1 else "neutral")
+    # Premium trade levels.
+    sl_pct = 0.15 if score >= 10 else 0.20
+    entry = option_ltp
+    stop_loss = round(max(entry * (1 - sl_pct), 1.0), 2)
+    risk = round(max(entry - stop_loss, 0.01), 2)
+    target1 = round(entry + risk * 1.0, 2)
+    target2 = round(entry + risk * 2.0, 2)
+    reward1 = round(target1 - entry, 2)
+    reward2 = round(target2 - entry, 2)
+    rr1 = round(reward1 / risk, 1) if risk > 0 else 0.0
+    rr2 = round(reward2 / risk, 1) if risk > 0 else 0.0
 
-    atm_tag = (
-        " (ATM)" if strike == atm else
-        " (ITM)" if (side == "CE" and strike < spot) or (side == "PE" and strike > spot) else
-        " (OTM)"
+    plan = OptionTradePlan(
+        side=side,
+        strike=strike,
+        option_security_id=int(option_security_id) if option_security_id is not None else None,
+        option_ltp=option_ltp,
+        entry=entry,
+        stop_loss=stop_loss,
+        target1=target1,
+        target2=target2,
+        risk=risk,
+        reward1=reward1,
+        reward2=reward2,
+        rr1=rr1,
+        rr2=rr2,
     )
-    emoji = "📈" if side == "CE" else "📉"
+    return strike, option_security_id, option_ltp, plan
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Signal builder
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def build_signal(
+    expiry: str,
+    candles: pd.DataFrame,
+    idx: int,
+    chain: Dict[str, Any],
+    is_backtest: bool = False,
+) -> Optional[Signal]:
+    window = candles.iloc[: idx + 1].reset_index(drop=True)
+    if len(window) < 5:
+        return None
+
+    patterns = detect_patterns(window)
+    if not patterns:
+        return None
+
+    candle_list = [
+        Candle(
+            ts=(row.timestamp.to_pydatetime() if hasattr(row.timestamp, "to_pydatetime") else row.timestamp),
+            open=float(row.open),
+            high=float(row.high),
+            low=float(row.low),
+            close=float(row.close),
+            volume=float(row.volume),
+        )
+        for row in window.itertuples(index=False)
+    ]
+
+    # For backtest with multi-day data, use single_day=False to reset VWAP per day
+    ctx = _analyse_intraday(candle_list, single_day=not is_backtest)
+    if ctx is None:
+        return None
+
+    direction, score, max_score, reasons = score_setup(window, chain, ctx, patterns)
+    if direction == "NEUTRAL":
+        return None
+    if score < MIN_SIGNAL_SCORE:
+        return None
+
+    bullish = direction == "BULLISH"
+    side = "CE" if bullish else "PE"
+    spot = float(window.iloc[-1].close)
+    pcr = compute_pcr_from_chain(chain)
+    data = chain.get("data", chain)
+    oc: Dict[str, Any] = data.get("oc") or {}
+    support, resistance = _support_resistance_oi(oc)
+    _, _, _, option_plan = _option_trade_plan(chain, spot, side, score)
+
+    confidence = _signal_confidence(score, max_score)
+
+    return Signal(
+        timestamp=_now_ist().isoformat(timespec="seconds"),
+        underlying_symbol=NIFTY50_NAME,
+        candle_time=str(ctx.last_candle.ts),
+        direction=direction,
+        score=score,
+        max_score=max_score,
+        pattern_names=patterns,
+        reasons=reasons,
+        vwap=ctx.vwap,
+        spot=spot,
+        pcr=pcr,
+        support=support,
+        resistance=resistance,
+        option_plan=option_plan,
+        confidence=confidence,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Telegram formatting
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def format_signal(signal: Signal) -> str:
+    emoji = "🟢" if signal.direction == "BULLISH" else "🔴"
+    reasons_text = "\n".join(f"• {r}" for r in signal.reasons[:7]) or "• No extra reasons"
+    patterns_text = ", ".join(signal.pattern_names)
+    plan = signal.option_plan
 
     lines = [
-        f"{emoji} <b>NIFTY {side} {strike:,.0f}{atm_tag} — Intraday</b>",
-        f"Expiry: {expiry}  |  Spot: {_fmt(spot)}",
+        f"{emoji} <b>NIFTY50 BUY SIGNAL</b>",
+        f"<b>Confidence:</b> {signal.confidence}",
+        f"<b>Score:</b> {signal.score}/{signal.max_score}",
+        f"<b>Candle Time:</b> {signal.candle_time}",
+        f"<b>Direction:</b> {signal.direction}",
+        f"<b>Patterns:</b> {patterns_text}",
         "",
-        "━━ Option Data ━━━━━━━━━━━━━━━━━━━━",
-        f"LTP        : ₹{_fmt(ltp)}",
-        f"Prev Close : ₹{_fmt(prev_close)}  ({price_chg:+.2f} / {price_chg_p:+.1f}%)",
-        f"Bid / Ask  : ₹{_fmt(bid)} / ₹{_fmt(ask)}",
-        f"IV         : {_fmt(iv, 1)}%",
-        f"OI         : {oi:,.0f}  (Chg: {oi_change:+,.0f})",
-        f"Volume     : {volume:,.0f}",
-    ]
-
-    # ── Intraday section ──────────────────────────────────────────────────────
-    if il:
-        trend_arrow = "↑" if il.trend == "uptrend" else ("↓" if il.trend == "downtrend" else "→")
-        lines += [
-            "",
-            "━━ Intraday Levels (5-min candles) ━",
-            f"Day Open   : ₹{_fmt(il.day_open)}",
-            f"Day High   : ₹{_fmt(il.day_high)}   ← Intraday Resistance",
-            f"Day Low    : ₹{_fmt(il.day_low)}   ← Intraday Support",
-            f"VWAP       : ₹{_fmt(il.vwap)}",
-            f"Trend      : {trend_arrow} {il.trend.capitalize()}  ({il.candle_count} candles so far)",
-            f"Last Candle: O={_fmt(il.last_candle.open)} H={_fmt(il.last_candle.high)} "
-            f"L={_fmt(il.last_candle.low)} C={_fmt(il.last_candle.close)}",
-            f"Prev Candle: H={_fmt(il.prev_candle_high)}  L={_fmt(il.prev_candle_low)}",
-            f"30-min S/R : Support={_fmt(il.intraday_support)}  Resistance={_fmt(il.intraday_resistance)}",
-        ]
-    else:
-        lines += [
-            "",
-            "⚠️ Intraday candle data unavailable (market may not have opened yet).",
-        ]
-
-    lines += [
+        "━━ Why this signal ━━",
+        reasons_text,
         "",
-        "━━ Market Context ━━━━━━━━━━━━━━━━━━",
-        f"PCR        : {_fmt(pcr)}  |  Bias: {bias}",
-        f"ATM Strike : {_fmt(atm, 0)}",
-        f"Max Pain   : {_fmt(max_pain, 0)}",
-        f"OI Support : {_fmt(oi_support, 0)}   (highest PE OI)",
-        f"OI Resist  : {_fmt(oi_resistance, 0)}  (highest CE OI)",
+        "━━ Market Context ━━",
+        f"Spot Price : ₹{signal.spot:,.2f}",
+        f"VWAP       : ₹{signal.vwap:,.2f}",
+        f"PCR        : {signal.pcr if signal.pcr is not None else '—'}",
+        f"Support    : {_fmt(signal.support, 0)}",
+        f"Resistance : {_fmt(signal.resistance, 0)}",
+        "",
+        "━━ Suggested Buy ━━",
+        f"Option Side : {plan.side}",
+        f"Strike      : {_fmt(plan.strike, 0)}",
+        f"Option LTP  : ₹{plan.option_ltp:,.2f}",
+        f"Entry       : ₹{plan.entry:,.2f}",
+        f"Stop Loss   : ₹{plan.stop_loss:,.2f}",
+        f"Target 1    : ₹{plan.target1:,.2f}",
+        f"Target 2    : ₹{plan.target2:,.2f}",
+        f"Risk        : ₹{plan.risk:,.2f}",
+        f"Reward T1   : ₹{plan.reward1:,.2f}  |  R:R = 1:{plan.rr1}",
+        f"Reward T2   : ₹{plan.reward2:,.2f}  |  R:R = 1:{plan.rr2}",
+        f"Option ID   : {plan.option_security_id if plan.option_security_id is not None else '—'}",
+        "",
+        f"<i>Updated: {_now_ist().strftime('%H:%M:%S %Z')}</i>",
     ]
-
-    # ── Trade levels ──────────────────────────────────────────────────────────
-    if ltp <= 0:
-        lines += ["", "⚠️ LTP is 0 — option may be illiquid or market closed."]
-    elif il is None:
-        lines += ["", "⚠️ Trade levels need intraday data — not available yet."]
-    else:
-        tl = _intraday_trade_levels(side, ltp, il, oi_support, oi_resistance, spot)
-        buy_emoji = "🟢" if side == "CE" else "🔴"
-        lines += [
-            "",
-            "━━ Intraday Trade Levels ━━━━━━━━━━━",
-            f"{buy_emoji} Buy (Entry) : ₹{_fmt(tl.buy)}",
-            f"🎯 Target 1  : ₹{_fmt(tl.target1)}   (1:1 R:R)",
-            f"🎯 Target 2  : ₹{_fmt(tl.target2)}   (1:2 R:R)",
-            f"🛑 Stop Loss : ₹{_fmt(tl.stop_loss)}",
-            "",
-            f"Risk         : ₹{_fmt(tl.risk)} per lot",
-            f"Reward T1    : ₹{_fmt(tl.reward1)}  |  R:R = 1:{tl.rr1}",
-            f"Reward T2    : ₹{_fmt(tl.reward2)}  |  R:R = 1:{tl.rr2}",
-            "",
-            tl.note,
-            "",
-            "<i>⚠️ Calculated levels only. Not financial advice.</i>",
-            "<i>Always verify before placing any trade.</i>",
-        ]
-
-    lines.append(f"\n<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>")
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Chain + status messages
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _build_chain_message(
-    rows, spot, expiry, support, resistance, atm, pcr, max_pain
-) -> str:
+def format_chain_message(rows: List[Tuple[float, Dict[str, Any]]], spot: float, expiry: str, support: Optional[float], resistance: Optional[float], atm: float, pcr: Optional[float], max_pain: Optional[float]) -> str:
     bias = "neutral"
     if pcr is not None:
         bias = "bearish" if pcr < 0.9 else ("bullish" if pcr > 1.1 else "neutral")
     lines = [
-        "<b>NIFTY 50 — Option Chain</b>",
+        f"<b>{NIFTY50_NAME} — Option Chain</b>",
         f"Expiry: {expiry}  |  Spot: {_fmt(spot)}  |  ATM: {_fmt(atm, 0)}",
         f"PCR: {_fmt(pcr)}  |  Bias: {bias}  |  Max Pain: {_fmt(max_pain, 0)}",
         f"Support S: {_fmt(support, 0)}   |   Resistance R: {_fmt(resistance, 0)}",
-        "", "<b>±5 strikes around ATM</b>", "<pre>",
+        "",
+        "<b>±5 strikes around ATM</b>",
+        "<pre>",
         f"{'Strike':<8} {'Tag':<7} {'CE OI':>9} {'CE LTP':>7} | {'PE LTP':>7} {'PE OI':>9}",
         "-" * 54,
     ]
     for strike, row in rows:
-        ce  = row.get("ce") or {}
-        pe  = row.get("pe") or {}
+        ce = row.get("ce") or {}
+        pe = row.get("pe") or {}
         tag = ("ATM" if strike == atm else "") + (" S" if strike == support else "") + (" R" if strike == resistance else "")
         lines.append(
-            f"{strike:<8,.0f} {tag.strip():<7} "
-            f"{_num(ce.get('oi')):>9,.0f} {_num(ce.get('last_price')):>7.2f} | "
-            f"{_num(pe.get('last_price')):>7.2f} {_num(pe.get('oi')):>9,.0f}"
+            f"{strike:<8,.0f} {tag.strip():<7} {_num(ce.get('oi')):>9,.0f} {_num(ce.get('last_price')):>7.2f} | {_num(pe.get('last_price')):>7.2f} {_num(pe.get('oi')):>9,.0f}"
         )
-    lines += ["</pre>", "S=Support  R=Resistance  ATM=At-the-money",
-              f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>"]
+    lines += ["</pre>", "S=Support  R=Resistance  ATM=At-the-money", f"<i>Updated: {_now_ist().strftime('%H:%M:%S %Z')}</i>"]
     return "\n".join(lines)
 
-def _build_status_message(spot, expiry, support, resistance, atm, pcr, max_pain, call_top, put_top) -> str:
+
+def format_status_message(spot: float, expiry: str, support: Optional[float], resistance: Optional[float], atm: float, pcr: Optional[float], max_pain: Optional[float], call_top: List[Tuple[float, float]], put_top: List[Tuple[float, float]]) -> str:
     bias = "neutral"
     if pcr is not None:
         bias = "bearish pressure" if pcr < 0.9 else ("bullish pressure" if pcr > 1.1 else "neutral")
     lines = [
-        f"<b>NIFTY Weekly Watch</b> | Expiry {expiry}",
+        f"<b>{NIFTY50_NAME} Weekly Watch</b> | Expiry {expiry}",
         f"Spot: {_fmt(spot)} | ATM: {_fmt(atm, 0)} | PCR: {_fmt(pcr)}",
         f"Bias: {bias}",
         f"Support: {_fmt(support, 0)} | Resistance: {_fmt(resistance, 0)} | Max Pain: {_fmt(max_pain, 0)}",
@@ -1266,150 +1056,363 @@ def _build_status_message(spot, expiry, support, resistance, atm, pcr, max_pain,
         lines.append("Top Call OI: " + ", ".join(f"{s:g}({oi:.0f})" for s, oi in call_top))
     if put_top:
         lines.append("Top Put OI:  " + ", ".join(f"{s:g}({oi:.0f})" for s, oi in put_top))
-    lines.append(f"<i>Updated: {datetime.now().strftime('%H:%M:%S')}</i>")
+    lines.append(f"<i>Updated: {_now_ist().strftime('%H:%M:%S %Z')}</i>")
     return "\n".join(lines)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Help
-# ─────────────────────────────────────────────────────────────────────────────
+HELP_TEXT = f"""<b>{NIFTY50_NAME} Bot Commands</b>
 
-HELP_TEXT = """<b>NIFTY Intraday Bot Commands</b>
+<b>Backtest scan</b>
+  SCAN 2026-05-01 2026-05-14
 
-<b>Strike Analysis (intraday)</b>
-  CE23700  — Call 23700: VWAP, high/low, trade levels
-  PE23700  — Put  23700: VWAP, high/low, trade levels
+<b>Live control</b>
+  LIVE   — enable live monitoring
+  STOP   — stop running scan
 
-<b>Market Overview</b>
+<b>Market overview</b>
   /chain   — ±5 strike option chain table
   /status  — Spot, PCR, bias, support, resistance
   /expiry  — Current weekly expiry
   /help    — This help message
 
-Type CE or PE followed by the strike (e.g. CE24500)."""
-
-STRIKE_RE = re.compile(r"^(CE|PE)\s*(\d{4,6})$", re.IGNORECASE)
+Alerts are sent only when score >= {MIN_SIGNAL_SCORE}.
+"""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Agent
+# Main engine
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class MarketWatchAgent:
     def __init__(self, cfg: Config):
-        self.cfg    = cfg
-        self.api    = DhanApiClient(cfg)
-        self.bot    = TelegramBot(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.http_timeout)
+        self.cfg = cfg
+        self.api = DhanApiClient(cfg)
+        self.bot = TelegramBot(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.http_timeout)
         self.expiry: Optional[str] = None
 
-    def _pick_expiry(self) -> str:
-        expiries = self.api.expiry_list()
-        today    = datetime.now().date()
-        future   = sorted(d for x in expiries if (d := _parse_date(x)) and d >= today)
-        if not future:
-            raise RuntimeError("No valid future expiry from Dhan.")
-        return future[0].isoformat()
+        self._live_lock = threading.Lock()
+        self._live_enabled = True
+        self.last_live_key: Optional[str] = None
+        self.last_live_candle_time: Optional[str] = None
+        self.last_signal_time: Dict[str, dt.datetime] = {}
+
+        self.scan_thread: Optional[threading.Thread] = None
+        self.scan_stop_event = threading.Event()
+        self.scan_lock = threading.Lock()
+
+    @property
+    def live_enabled(self) -> bool:
+        with self._live_lock:
+            return self._live_enabled
+
+    @live_enabled.setter
+    def live_enabled(self, value: bool) -> None:
+        with self._live_lock:
+            self._live_enabled = value
 
     def _ensure_expiry(self) -> str:
         if self.expiry is None:
-            self.expiry = self._pick_expiry()
+            self.expiry = self.api.pick_expiry()
         return self.expiry
 
-    def _fetch_chain(self):
-        expiry   = self._ensure_expiry()
+    def _fetch_chain(self) -> Tuple[str, float, Dict[str, Any]]:
+        expiry = self._ensure_expiry()
         snapshot = self.api.option_chain(expiry)
-        data     = snapshot.get("data", {})
-        spot     = _num(data.get("last_price"))
+        data = snapshot.get("data", {})
+        spot = _num(data.get("last_price"))
         oc: Dict[str, Any] = data.get("oc") or {}
         if not oc:
             raise RuntimeError("Empty option chain — market may be closed.")
         return expiry, spot, oc
 
-    def _fetch_intraday(self) -> Optional[IntradayLevels]:
-        """Fetch 5-min candles for NIFTY index and compute intraday levels."""
+    def _fetch_intraday(self, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
+        return self.api.intraday_candles(
+            security_id=NIFTY50_SECURITY_ID,
+            exchange_segment=NIFTY50_SEGMENT,
+            instrument="INDEX",
+            interval=5,
+            from_date=start.strftime("%Y-%m-%d %H:%M:%S"),
+            to_date=end.strftime("%Y-%m-%d %H:%M:%S"),
+            oi=True,
+        )
+
+    def _current_intraday(self) -> pd.DataFrame:
+        now = _now_ist()
+        start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+        end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+        return self._fetch_intraday(start, end)
+
+    def _check_cooldown(self, direction: str) -> bool:
+        """Return True if we should send this signal (cooldown passed)."""
+        now = _now_ist()
+        last_time = self.last_signal_time.get(direction)
+        if last_time is None:
+            return True
+        elapsed = (now - last_time).total_seconds()
+        return elapsed >= SIGNAL_COOLDOWN_SECONDS
+
+    def _record_signal_time(self, direction: str) -> None:
+        self.last_signal_time[direction] = _now_ist()
+
+    # ───────────────────────────────
+    # Signal helpers
+    # ───────────────────────────────
+
+    def _evaluate_dataframe(self, candles: pd.DataFrame, expiry: str, chain: Dict[str, Any], idx: int, is_backtest: bool = False) -> Optional[Signal]:
+        return build_signal(expiry, candles, idx, chain, is_backtest=is_backtest)
+
+    def _send_signal(self, signal: Signal, prefix: str = "") -> None:
+        msg = format_signal(signal)
+        if prefix:
+            msg = f"{prefix}\n\n{msg}"
+        self.bot.send(msg)
+
+    # ───────────────────────────────
+    # Live monitoring
+    # ───────────────────────────────
+
+    def _live_check(self) -> None:
+        if not self.live_enabled:
+            return
+        if not _market_session_open():
+            return
+
+        expiry = self._ensure_expiry()
+        candles = self._current_intraday()
+        if candles.empty or len(candles) < 5:
+            return
+
+        latest = candles.iloc[-1]
+        candle_time = str(latest.timestamp)
+        if candle_time == self.last_live_candle_time:
+            return
+
+        chain = self.api.option_chain(expiry)
+        signal = build_signal(expiry, candles.reset_index(drop=True), len(candles) - 1, chain, is_backtest=False)
+        self.last_live_candle_time = candle_time
+
+        if signal is None:
+            return
+
+        key = f"{signal.candle_time}|{signal.direction}|{','.join(signal.pattern_names)}"
+        if key == self.last_live_key:
+            return
+
+        if not self._check_cooldown(signal.direction):
+            return
+
+        self._send_signal(signal, prefix="<b>LIVE ALERT</b>")
+        self.last_live_key = key
+        self._record_signal_time(signal.direction)
+
+    # ───────────────────────────────
+    # Scan / backtest
+    # ───────────────────────────────
+
+    def _scan_worker(self, start_date: str, end_date: str) -> None:
         try:
+            expiry = self._ensure_expiry()
+            self.bot.send(
+                f"⏳ Backtesting {NIFTY50_NAME} 5-minute candles\n"
+                f"From: <b>{start_date}</b>\n"
+                f"To: <b>{end_date}</b>\n\n"
+                f"Alerts only when score >= {MIN_SIGNAL_SCORE}.\n"
+                f"Option chain refreshed per trading day."
+            )
+
             candles = self.api.intraday_candles(
-                security_id=self.cfg.underlying_security_id,
-                exchange_segment=self.cfg.underlying_segment,
+                security_id=NIFTY50_SECURITY_ID,
+                exchange_segment=NIFTY50_SEGMENT,
                 instrument="INDEX",
                 interval=5,
+                from_date=f"{start_date} 09:15:00",
+                to_date=f"{end_date} 15:30:00",
+                oi=True,
             )
-            return _analyse_intraday(candles)
-        except Exception as e:
-            print(f"Intraday fetch failed: {e}")
-            return None
 
-    # ── handlers ──────────────────────────────────────────────────────────────
+            if candles.empty:
+                self.bot.send("⚠️ No candles returned for that range.")
+                return
+
+            # Filter to market hours only
+            candles = candles[candles["timestamp"].apply(lambda ts: _is_market_hours(ts))].reset_index(drop=True)
+            if candles.empty:
+                self.bot.send("⚠️ No candles within market hours for that range.")
+                return
+
+            # Group candles by date for per-day chain fetching
+            candles["date"] = candles["timestamp"].dt.date
+            unique_dates = sorted(candles["date"].unique())
+
+            chain_cache: Dict[dt.date, Dict[str, Any]] = {}
+            last_key: Optional[str] = None
+            sent = 0
+
+            for idx in range(4, len(candles)):
+                if self.scan_stop_event.is_set():
+                    self.bot.send("🛑 Scan stopped by user.")
+                    return
+
+                candle_date = candles.iloc[idx]["date"]
+
+                # Fetch chain for this day if not cached
+                if candle_date not in chain_cache:
+                    try:
+                        chain_cache[candle_date] = self.api.option_chain(expiry)
+                    except Exception as e:
+                        print(f"Failed to fetch chain for {candle_date}: {e}")
+                        continue
+
+                chain = chain_cache[candle_date]
+                window = candles.iloc[: idx + 1].copy().reset_index(drop=True)
+                signal = self._evaluate_dataframe(window, expiry, chain, idx, is_backtest=True)
+                if signal is None:
+                    continue
+
+                key = f"{signal.candle_time}|{signal.direction}|{','.join(signal.pattern_names)}"
+                if key == last_key:
+                    continue
+
+                self._send_signal(signal, prefix="<b>BACKTEST ALERT</b>")
+                last_key = key
+                sent += 1
+                time.sleep(0.3)
+
+            self.bot.send(f"✅ Scan completed. Sent {sent} alert(s).")
+        except Exception as e:
+            self.bot.send(f"⚠️ Scan error: {e}")
+        finally:
+            self.scan_stop_event.clear()
+            with self.scan_lock:
+                self.scan_thread = None
+
+    def _start_scan(self, start_date: str, end_date: str) -> None:
+        with self.scan_lock:
+            if self.scan_thread is not None and self.scan_thread.is_alive():
+                self.bot.send("⚠️ A scan is already running.")
+                return
+            self.scan_stop_event.clear()
+            self.scan_thread = threading.Thread(
+                target=self._scan_worker,
+                args=(start_date, end_date),
+                daemon=True,
+            )
+            self.scan_thread.start()
+
+    # ───────────────────────────────
+    # Commands
+    # ───────────────────────────────
+
+    def _handle_chain(self) -> None:
+        expiry, spot, oc = self._fetch_chain()
+        all_strikes = sorted(float(k) for k in oc.keys())
+        atm = _nearest_strike(all_strikes, spot)
+        rows = _strikes_around_atm(oc, spot, self.cfg.strikes_window)
+        support, resistance = _support_resistance_oi(oc)
+        pcr_val = _pcr(oc, spot, self.cfg.strikes_window)
+        max_pain_val = _max_pain(oc)
+        self.bot.send(format_chain_message(rows, spot, expiry, support, resistance, atm, pcr_val, max_pain_val))
+
+    def _handle_status(self) -> None:
+        expiry, spot, oc = self._fetch_chain()
+        all_strikes = sorted(float(k) for k in oc.keys())
+        atm = _nearest_strike(all_strikes, spot)
+        support, resistance = _support_resistance_oi(oc)
+        pcr_val = _pcr(oc, spot, self.cfg.strikes_window)
+        max_pain_val = _max_pain(oc)
+        call_top = _top_oi(oc, "ce", 3)
+        put_top = _top_oi(oc, "pe", 3)
+        self.bot.send(format_status_message(spot, expiry, support, resistance, atm, pcr_val, max_pain_val, call_top, put_top))
 
     def _handle_strike(self, side: str, strike: float) -> None:
         expiry, spot, oc = self._fetch_chain()
-
-        all_strikes         = sorted(float(k) for k in oc.keys())
-        atm                 = _nearest_strike(all_strikes, spot)
-        oi_support, oi_res  = _support_resistance_oi(oc)
-        pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-        max_pain_val        = _max_pain(oc)
-
-        row         = _get_row(oc, strike)
+        row = _get_row(oc, strike)
         option_data = row.get(side.lower(), {})
-
         if not row:
+            strikes = sorted(float(k) for k in oc.keys())
             self.bot.send(
                 f"⚠️ Strike <b>{strike:,.0f}</b> not found in the option chain.\n"
-                f"Range: {all_strikes[0]:,.0f} – {all_strikes[-1]:,.0f}"
+                f"Range: {strikes[0]:,.0f} – {strikes[-1]:,.0f}"
             )
             return
 
-        # Fetch intraday levels for NIFTY underlying
-        self.bot.send("⏳ Fetching intraday candles…")
-        il = self._fetch_intraday()
+        support, resistance = _support_resistance_oi(oc)
+        pcr_val = _pcr(oc, spot, self.cfg.strikes_window)
+        all_strikes = sorted(float(k) for k in oc.keys())
+        atm = _nearest_strike(all_strikes, spot)
 
-        msg = _build_strike_message(
-            side=side, strike=strike, option_data=option_data,
-            spot=spot, expiry=expiry,
-            oi_support=oi_support, oi_resistance=oi_res,
-            atm=atm, pcr=pcr_val, max_pain=max_pain_val,
-            il=il,
+        candles = self._current_intraday()
+        if candles.empty or len(candles) < 5:
+            self.bot.send("⚠️ Could not fetch intraday candles for strike analysis.")
+            return
+
+        ctx = _analyse_intraday([
+            Candle(
+                ts=(row.timestamp.to_pydatetime() if hasattr(row.timestamp, "to_pydatetime") else row.timestamp),
+                open=float(row.open),
+                high=float(row.high),
+                low=float(row.low),
+                close=float(row.close),
+                volume=float(row.volume),
+            )
+            for row in candles.itertuples(index=False)
+        ])
+        if ctx is None:
+            self.bot.send("⚠️ Intraday context unavailable.")
+            return
+
+        ltp = _num(option_data.get("last_price"))
+        if ltp <= 0:
+            ltp = max(1.0, abs(spot - strike) / 4.0)
+        _, _, _, plan = _option_trade_plan({"data": {"oc": oc}}, spot, side, MIN_SIGNAL_SCORE)
+        signal = Signal(
+            timestamp=_now_ist().isoformat(timespec="seconds"),
+            underlying_symbol=NIFTY50_NAME,
+            candle_time=str(ctx.last_candle.ts),
+            direction="BULLISH" if side == "CE" else "BEARISH",
+            score=MIN_SIGNAL_SCORE,
+            max_score=11,
+            pattern_names=[f"Manual query: {side}{int(strike)}"],
+            reasons=["Manual strike lookup using current option chain"],
+            vwap=ctx.vwap,
+            spot=spot,
+            pcr=pcr_val,
+            support=support,
+            resistance=resistance,
+            option_plan=dataclasses.replace(plan, option_ltp=ltp, strike=strike, side=side),
+            confidence="Manual",
         )
-        self.bot.send(msg)
-
-    def _handle_chain(self) -> None:
-        expiry, spot, oc    = self._fetch_chain()
-        all_strikes         = sorted(float(k) for k in oc.keys())
-        atm                 = _nearest_strike(all_strikes, spot)
-        rows                = _strikes_around_atm(oc, spot, self.cfg.strikes_window)
-        support, resistance = _support_resistance_oi(oc)
-        pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-        max_pain_val        = _max_pain(oc)
-        self.bot.send(_build_chain_message(rows, spot, expiry, support, resistance, atm, pcr_val, max_pain_val))
-
-    def _handle_status(self) -> None:
-        expiry, spot, oc    = self._fetch_chain()
-        all_strikes         = sorted(float(k) for k in oc.keys())
-        atm                 = _nearest_strike(all_strikes, spot)
-        support, resistance = _support_resistance_oi(oc)
-        pcr_val             = _pcr(oc, spot, self.cfg.strikes_window)
-        max_pain_val        = _max_pain(oc)
-        call_top            = _top_oi(oc, "ce", 3)
-        put_top             = _top_oi(oc, "pe", 3)
-        self.bot.send(_build_status_message(spot, expiry, support, resistance, atm, pcr_val, max_pain_val, call_top, put_top))
-
-    # ── dispatcher ────────────────────────────────────────────────────────────
+        self._send_signal(signal, prefix="<b>STRIKE SNAPSHOT</b>")
 
     def _dispatch(self, raw: str) -> None:
         text = raw.strip()
-        cmd  = text.split("@")[0].lower()
+        cmd = text.split("@")[0].lower()
 
         m = STRIKE_RE.match(text.replace(" ", ""))
         if m:
-            side   = m.group(1).upper()
-            strike = float(m.group(2))
-            print(f"  Strike query: {side} {strike}")
-            self._handle_strike(side, strike)
+            self._handle_strike(m.group(1).upper(), float(m.group(2)))
             return
 
-        if cmd in ("/chain", "chain"):       self._handle_chain()
-        elif cmd in ("/status", "status"):   self._handle_status()
+        m = SCAN_RE.match(text)
+        if m:
+            self._start_scan(m.group(1), m.group(2))
+            return
+
+        if STOP_RE.match(text):
+            self.scan_stop_event.set()
+            self.bot.send("🛑 Stop requested.")
+            return
+
+        if LIVE_RE.match(text):
+            self.live_enabled = True
+            self.bot.send("✅ Live monitoring enabled.")
+            return
+
+        if cmd in ("/chain", "chain"):
+            self._handle_chain()
+        elif cmd in ("/status", "status"):
+            self._handle_status()
         elif cmd in ("/expiry", "expiry"):
             self.bot.send(f"Current weekly expiry: <b>{self._ensure_expiry()}</b>")
         elif cmd in ("/help", "help", "/start", "start"):
@@ -1417,11 +1420,19 @@ class MarketWatchAgent:
         else:
             self.bot.send(f"Unknown command: <code>{text}</code>\n\n{HELP_TEXT}")
 
-    # ── main loop ─────────────────────────────────────────────────────────────
+    # ───────────────────────────────
+    # Run loop
+    # ───────────────────────────────
 
     def run(self) -> None:
-        print(f"Market Watch Agent started | {self.cfg.underlying_name_hint}")
-        self.bot.send(f"<b>NIFTY Intraday Bot is online!</b>\n\n{HELP_TEXT}")
+        print(f"Market Watch Agent started | {NIFTY50_NAME}")
+        self.bot.send(
+            f"<b>{NIFTY50_NAME} Signal Bot is online!</b>\n\n"
+            f"Live monitoring is ON.\n"
+            f"Send <code>SCAN YYYY-MM-DD YYYY-MM-DD</code> for backtest.\n"
+            f"Send <code>STOP</code> to stop a scan.\n"
+            f"Alerts fire only when score >= {MIN_SIGNAL_SCORE}."
+        )
 
         while True:
             try:
@@ -1433,10 +1444,16 @@ class MarketWatchAgent:
                         err = f"⚠️ Error: {e}"
                         print(err)
                         self.bot.send(err)
+
+                try:
+                    self._live_check()
+                except Exception as e:
+                    print(f"Live check error: {e}")
+
                 time.sleep(self.cfg.tg_poll_interval)
 
             except KeyboardInterrupt:
-                self.bot.send("NIFTY Intraday Bot stopped.")
+                self.bot.send(f"{NIFTY50_NAME} Signal Bot stopped.")
                 print("Stopped.")
                 return
             except requests.HTTPError as e:
@@ -1448,10 +1465,14 @@ class MarketWatchAgent:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Main
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 def main() -> None:
     cfg = Config.from_env()
     MarketWatchAgent(cfg).run()
+
 
 if __name__ == "__main__":
     main()
