@@ -1,1 +1,1 @@
-
+worker: python dhan_5m_candle_alerts.py
