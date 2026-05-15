@@ -1,2 +1,2 @@
 alerts: python dhan_5m_candle_alerts.py
-worker: python scoring_system.py
+scanner: python scoring_system.py
