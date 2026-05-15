@@ -1,2 +1,2 @@
 worker1: python dhan_5m_candle_alerts.py
-worker2: python nifty50_signal_bot_fixed.py
+worker2: python scoring_system.py
