@@ -298,6 +298,18 @@ class BacktestTrade:
 
 
 @dataclass
+class LivePosition:
+    plan: OptionTradePlan
+    signal_time: dt.datetime
+    opened_at: dt.datetime
+    trigger_key: str
+    current_sl: float
+    remaining_qty: int
+    t1_hit: bool = False
+    last_checked_option_ts: Optional[pd.Timestamp] = None
+
+
+@dataclass
 class BacktestResult:
     start_date: str
     end_date: str
@@ -1735,6 +1747,58 @@ def format_signal(signal: BrahmastraSignal) -> str:
     return "\n".join(lines)
 
 
+def format_live_position_update(
+    position: LivePosition,
+    action: str,
+    reason: str,
+    price: Optional[float],
+    event_time: Any,
+    note: Optional[str] = None,
+) -> str:
+    plan = position.plan
+    lines = [
+        "<b>LIVE POSITION UPDATE</b>",
+        f"<b>Action:</b> {tg_escape(action)}",
+        f"<b>Reason:</b> {tg_escape(reason)}",
+        f"Time        : {tg_escape(event_time)}",
+        f"Option      : {plan.side} {fmt(plan.strike, 0)}",
+        f"Opened at   : {tg_escape(position.opened_at)}",
+        f"Entry       : Rs {fmt(plan.option_entry)}",
+        f"Current SL  : Rs {fmt(position.current_sl)}",
+        f"Target 1    : Rs {fmt(plan.option_target1)}",
+        f"Target 2    : Rs {fmt(plan.option_target2)}",
+    ]
+    if price is not None:
+        lines.append(f"Ref Price   : Rs {fmt(price)}")
+    lines.append(f"Remaining   : {position.remaining_qty} qty")
+    if note:
+        lines += ["", tg_escape(note)]
+    return "\n".join(lines)
+
+
+def format_live_position_status(positions: List[LivePosition]) -> str:
+    if not positions:
+        return "No active live positions being tracked."
+
+    lines = ["<b>Active Live Positions</b>", f"Count: {len(positions)}"]
+    for i, position in enumerate(positions, start=1):
+        plan = position.plan
+        lines += [
+            "",
+            f"<b>#{i} {plan.side} {fmt(plan.strike, 0)}</b>",
+            f"Expiry      : {tg_escape(plan.expiry)}",
+            f"Security ID : {plan.option_security_id}",
+            f"Entry       : Rs {fmt(plan.option_entry)}",
+            f"Current SL  : Rs {fmt(position.current_sl)}",
+            f"Target 1    : Rs {fmt(plan.option_target1)}",
+            f"Target 2    : Rs {fmt(plan.option_target2)}",
+            f"T1 Hit      : {'yes' if position.t1_hit else 'no'}",
+            f"Remaining   : {position.remaining_qty} qty",
+            f"Opened at   : {tg_escape(position.opened_at)}",
+        ]
+    return "\n".join(lines)
+
+
 def format_chain_message(rows: List[Tuple[float, Dict[str, Any]]], spot: float, expiry: str, support: Optional[float], resistance: Optional[float], atm: float, pcr: Optional[float]) -> str:
     lines = [
         f"<b>{NIFTY50_NAME} Option Chain</b>",
@@ -1838,6 +1902,7 @@ HELP_TEXT = """<b>NIFTY Brahmastra Bot Commands</b>
 <b>Live control</b>
   LIVE   - enable live monitoring
   STOP   - stop running scan
+  /position - active live trade levels
 
 <b>Market overview</b>
   /chain   - option chain around ATM
@@ -1867,6 +1932,7 @@ class BrahmastraBot:
         self.live_enabled = cfg.live_enabled_at_start
         self.last_live_candle_time: Optional[str] = None
         self.last_live_trigger: Optional[str] = None
+        self.live_positions: List[LivePosition] = []
 
         self.scan_thread: Optional[threading.Thread] = None
         self.scan_stop_event = threading.Event()
@@ -1907,6 +1973,147 @@ class BrahmastraBot:
         signal.option_plan = make_option_plan(signal, index_df, signal_idx, contract, option_df, self.cfg)
         return signal
 
+    def open_live_position(self, signal: BrahmastraSignal) -> None:
+        if signal.option_plan is None:
+            return
+        signal_ts = pd.Timestamp(signal.candle_time)
+        for position in self.live_positions:
+            if position.trigger_key == signal.trigger_key and pd.Timestamp(position.signal_time) == signal_ts:
+                return
+
+        self.live_positions.append(LivePosition(
+            plan=signal.option_plan,
+            signal_time=signal.candle_time,
+            opened_at=now_ist().replace(tzinfo=None),
+            trigger_key=signal.trigger_key,
+            current_sl=signal.option_plan.option_stop_loss,
+            remaining_qty=self.cfg.quantity,
+            last_checked_option_ts=signal_ts,
+        ))
+
+    def track_live_position(self, index_df: pd.DataFrame, position: LivePosition) -> bool:
+        """Return True while the position remains open."""
+
+        plan = position.plan
+        start, end = day_start_end(today_ist())
+        option_df = self.api.option_intraday(plan.option_security_id, start, end)
+        option_df = closed_candles_only(option_df, self.cfg.candle_interval)
+        if option_df.empty:
+            return True
+
+        index_by_ts = {pd.Timestamp(row.timestamp): i for i, row in index_df.iterrows()}
+        last_ts = position.last_checked_option_ts or pd.Timestamp(position.signal_time)
+        new_rows = option_df[option_df["timestamp"] > last_ts].reset_index(drop=True)
+        if new_rows.empty:
+            return True
+
+        half_qty = max(1, self.cfg.quantity // 2)
+
+        for _, row in new_rows.iterrows():
+            row_ts = pd.Timestamp(row.timestamp)
+            low = float(row.low)
+            high = float(row.high)
+            close = float(row.close)
+            position.last_checked_option_ts = row_ts
+
+            if row.timestamp.time() >= self.cfg.square_off_time:
+                self.bot.send(
+                    format_live_position_update(
+                        position,
+                        "EXIT FULL",
+                        "15:20 square-off time",
+                        close,
+                        row.timestamp,
+                        "No SL/target exit came first, so close the live position at market square-off.",
+                    )
+                )
+                return False
+
+            if low <= position.current_sl:
+                action = "EXIT FULL" if not position.t1_hit else "EXIT REMAINING"
+                reason = "stop loss" if not position.t1_hit else "trailing/breakeven stop"
+                self.bot.send(format_live_position_update(position, action, reason, position.current_sl, row.timestamp))
+                return False
+
+            if not position.t1_hit and high >= plan.option_target1:
+                booked_qty = min(half_qty, position.remaining_qty)
+                position.remaining_qty -= booked_qty
+                position.t1_hit = True
+                position.current_sl = max(position.current_sl, plan.option_entry)
+                self.bot.send(
+                    format_live_position_update(
+                        position,
+                        f"BOOK {booked_qty} QTY",
+                        "target 1 hit; move SL to entry",
+                        plan.option_target1,
+                        row.timestamp,
+                        "Keep the remaining quantity running for T2 or trailing stop.",
+                    )
+                )
+                if position.remaining_qty <= 0:
+                    return False
+
+            if position.t1_hit and high >= plan.option_target2:
+                self.bot.send(
+                    format_live_position_update(
+                        position,
+                        "EXIT REMAINING",
+                        "target 2 hit",
+                        plan.option_target2,
+                        row.timestamp,
+                    )
+                )
+                return False
+
+            if position.t1_hit:
+                prev_rows = option_df[option_df["timestamp"] < row.timestamp]
+                if not prev_rows.empty:
+                    prev_low = float(prev_rows.iloc[-1].low)
+                    new_sl = max(position.current_sl, round(prev_low - self.cfg.option_sl_buffer, 2), plan.option_entry)
+                    if new_sl > position.current_sl:
+                        position.current_sl = new_sl
+                        self.bot.send(
+                            format_live_position_update(
+                                position,
+                                "TRAIL SL",
+                                "previous option candle low trail",
+                                None,
+                                row.timestamp,
+                            )
+                        )
+
+            idx = index_by_ts.get(row_ts)
+            if idx is not None and pd.Timestamp(index_df.iloc[idx].timestamp) > pd.Timestamp(position.signal_time):
+                if opposite_exit_signal(index_df, idx, plan.side):
+                    action = "EXIT FULL" if not position.t1_hit else "EXIT REMAINING"
+                    self.bot.send(
+                        format_live_position_update(
+                            position,
+                            action,
+                            "opposite Brahmastra signal",
+                            close,
+                            row.timestamp,
+                            "No SL/target exit came first; close because the setup has reversed.",
+                        )
+                    )
+                    return False
+
+        return True
+
+    def track_live_positions(self, index_df: pd.DataFrame) -> None:
+        if not self.live_positions:
+            return
+
+        still_open: List[LivePosition] = []
+        for position in list(self.live_positions):
+            try:
+                if self.track_live_position(index_df, position):
+                    still_open.append(position)
+            except Exception as exc:
+                print(f"Live position tracking error: {exc}")
+                still_open.append(position)
+        self.live_positions = still_open
+
     def live_check(self) -> None:
         if not self.live_enabled or not market_session_open():
             return
@@ -1919,6 +2126,8 @@ class BrahmastraBot:
         index_df = add_indicators(raw, self.cfg)
         latest = index_df.iloc[-1]
         candle_time = str(latest.timestamp)
+        self.track_live_positions(index_df)
+
         if candle_time == self.last_live_candle_time:
             return
         self.last_live_candle_time = candle_time
@@ -1931,6 +2140,7 @@ class BrahmastraBot:
 
         signal = self.build_live_plan(signal, index_df, len(index_df) - 1)
         self.bot.send(format_signal(signal))
+        self.open_live_position(signal)
         self.last_live_trigger = signal.trigger_key
 
     def scan_worker(self, start_date: str, end_date: str) -> None:
@@ -2039,6 +2249,8 @@ class BrahmastraBot:
             self.handle_chain()
         elif cmd in ("/status", "status"):
             self.handle_status()
+        elif cmd in ("/position", "position"):
+            self.bot.send(format_live_position_status(self.live_positions))
         elif cmd in ("/expiry", "expiry"):
             self.bot.send(f"Current weekly expiry: <b>{self.ensure_expiry()}</b>")
         elif cmd in ("/help", "help", "/start", "start"):
