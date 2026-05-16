@@ -1807,15 +1807,18 @@ def format_backtest_summary(result: BacktestResult) -> str:
             lines.append(f"{day}: Rs {fmt(pnl)}")
 
         lines += ["", "<b>Recent Trades</b>", "<pre>"]
-        lines.append(f"{'Time':<16} {'Opt':<10} {'Entry':>7} {'Exit':>7} {'PnL':>9} {'Reason':<16}")
-        lines.append("-" * 72)
+        lines.append(f"{'Time':<16} {'Opt':<10} {'Entry':>7} {'SL':>7} {'T1':>7} {'T2':>7} {'Exit':>7} {'PnL':>9} {'Reason':<14}")
+        lines.append("-" * 96)
         for trade in trades[-8:]:
             entry_time = str(trade.entry_time)[5:16]
             opt = f"{int(trade.strike)}{trade.side}"
             lines.append(
-                f"{entry_time:<16} {opt:<10} {trade.entry:>7.2f} {trade.exit_price:>7.2f} {trade.pnl:>9.2f} {trade.exit_reason:<16}"
+                f"{entry_time:<16} {opt:<10} {trade.entry:>7.2f} {trade.initial_sl:>7.2f} "
+                f"{trade.target1:>7.2f} {trade.target2:>7.2f} {trade.exit_price:>7.2f} "
+                f"{trade.pnl:>9.2f} {trade.exit_reason:<14}"
             )
         lines.append("</pre>")
+        lines.append("SL shown is the initial option stop loss used at entry.")
 
     if result.errors:
         lines += ["", "<b>Warnings</b>"]
