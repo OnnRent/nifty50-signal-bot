@@ -35,6 +35,11 @@ Environment variables
 Useful optional variables
 - DHAN_SCRIP_MASTER_CSV=/path/to/api-scrip-master.csv
 - DOWNLOAD_DHAN_MASTER=true
+- DHAN_SCRIP_MASTER_URL=https://images.dhan.co/api-data/api-scrip-master.csv
+- DHAN_MASTER_REFRESH_DAYS=1
+- USE_DHAN_EXPIRED_OPTIONS_API=true
+- EXPIRED_OPTIONS_EXPIRY_FLAG=WEEK
+- EXPIRED_OPTIONS_EXPIRY_CODE=0
 - MAX_BACKTEST_EXPIRY_GAP_DAYS=10
 - MIN_PREMIUM=60
 - PREFERRED_PREMIUM_MIN=80
@@ -71,6 +76,7 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 DHAN_BASE = "https://api.dhan.co/v2"
 TELEGRAM_BASE = "https://api.telegram.org"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
+DHAN_MASTER_DETAILED_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
 NIFTY50_SECURITY_ID = 13
 NIFTY50_SEGMENT = "IDX_I"
@@ -112,6 +118,14 @@ def _env_float(name: str, default: float) -> float:
         return float(os.getenv(name, str(default)).strip())
     except Exception:
         return default
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    value = value.strip()
+    return value or default
 
 
 @dataclass
@@ -165,6 +179,11 @@ class Config:
 
     dhan_scrip_master_csv: Optional[str] = None
     download_dhan_master: bool = False
+    dhan_scrip_master_url: str = DHAN_MASTER_URL
+    dhan_master_refresh_days: int = 1
+    use_dhan_expired_options_api: bool = True
+    expired_options_expiry_flag: str = "WEEK"
+    expired_options_expiry_code: int = 0
 
     @property
     def quantity(self) -> int:
@@ -217,6 +236,11 @@ class Config:
             live_enabled_at_start=_env_bool("LIVE_ENABLED", True),
             dhan_scrip_master_csv=(os.getenv("DHAN_SCRIP_MASTER_CSV") or "").strip() or None,
             download_dhan_master=_env_bool("DOWNLOAD_DHAN_MASTER", False),
+            dhan_scrip_master_url=_env_str("DHAN_SCRIP_MASTER_URL", DHAN_MASTER_URL),
+            dhan_master_refresh_days=_env_int("DHAN_MASTER_REFRESH_DAYS", 1),
+            use_dhan_expired_options_api=_env_bool("USE_DHAN_EXPIRED_OPTIONS_API", True),
+            expired_options_expiry_flag=_env_str("EXPIRED_OPTIONS_EXPIRY_FLAG", "WEEK").upper(),
+            expired_options_expiry_code=_env_int("EXPIRED_OPTIONS_EXPIRY_CODE", 0),
         )
 
 
@@ -498,6 +522,54 @@ class DhanApiClient:
             to_date=end.strftime("%Y-%m-%d %H:%M:%S"),
             oi=True,
         )
+
+    def rolling_option_intraday(
+        self,
+        side: str,
+        strike_offset: int,
+        start: dt.datetime,
+        end: dt.datetime,
+    ) -> pd.DataFrame:
+        if abs(strike_offset) > 10:
+            raise ValueError("Dhan expired-options API supports index option offsets only up to ATM+10/ATM-10.")
+
+        strike = "ATM" if strike_offset == 0 else f"ATM{strike_offset:+d}"
+        option_type = "CALL" if side.upper() == "CE" else "PUT"
+        payload = {
+            "exchangeSegment": FNO_SEGMENT,
+            "interval": str(self.cfg.candle_interval),
+            "securityId": NIFTY50_SECURITY_ID,
+            "instrument": OPTION_INSTRUMENT,
+            "expiryFlag": self.cfg.expired_options_expiry_flag,
+            "expiryCode": self.cfg.expired_options_expiry_code,
+            "strike": strike,
+            "drvOptionType": option_type,
+            "requiredData": ["open", "high", "low", "close", "volume", "oi", "strike", "spot"],
+            "fromDate": start.strftime("%Y-%m-%d"),
+            "toDate": (end.date() + dt.timedelta(days=1)).strftime("%Y-%m-%d"),
+        }
+        r = self.session.post(
+            f"{DHAN_BASE}/charts/rollingoption",
+            data=json.dumps(payload),
+            timeout=self.cfg.http_timeout,
+        )
+        self._raise_for_status(r, "/charts/rollingoption")
+
+        raw = r.json()
+        data = raw.get("data", {}) if isinstance(raw, dict) else {}
+        side_key = "ce" if side.upper() == "CE" else "pe"
+        series = data.get(side_key)
+        if not isinstance(series, dict):
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume", "open_interest"])
+
+        df = self._dict_to_df(series)
+        if "oi" in series and len(series["oi"]) == len(df):
+            df["open_interest"] = pd.to_numeric(series["oi"], errors="coerce")
+        if "strike" in series and len(series["strike"]) == len(df):
+            df["strike"] = pd.to_numeric(series["strike"], errors="coerce")
+        if "spot" in series and len(series["spot"]) == len(df):
+            df["spot"] = pd.to_numeric(series["spot"], errors="coerce")
+        return df[(df["timestamp"] >= pd.Timestamp(start)) & (df["timestamp"] <= pd.Timestamp(end))].reset_index(drop=True)
 
     @staticmethod
     def _rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -841,14 +913,24 @@ class OptionContractResolver:
         self.master: Optional[pd.DataFrame] = None
         self._load_master_if_available()
 
+    def _master_needs_download(self, path: Path) -> bool:
+        if not path.exists():
+            return True
+        refresh_days = self.cfg.dhan_master_refresh_days
+        if refresh_days <= 0:
+            return False
+        age_seconds = time.time() - path.stat().st_mtime
+        return age_seconds >= refresh_days * 24 * 60 * 60
+
     def _load_master_if_available(self) -> None:
         path = self.cfg.dhan_scrip_master_csv
         if not path and self.cfg.download_dhan_master:
             path = str(Path(__file__).with_name("dhan_api_scrip_master.csv"))
-            if not Path(path).exists():
-                r = requests.get(DHAN_MASTER_URL, timeout=self.cfg.http_timeout)
+            csv_path = Path(path)
+            if self._master_needs_download(csv_path):
+                r = requests.get(self.cfg.dhan_scrip_master_url, timeout=self.cfg.http_timeout)
                 r.raise_for_status()
-                Path(path).write_bytes(r.content)
+                csv_path.write_bytes(r.content)
 
         if not path:
             return
@@ -877,8 +959,8 @@ class OptionContractResolver:
 
     def pick_expiry_for_date(self, trade_date: dt.date) -> str:
         if self.master is not None:
-            expiry_col = self._col(["expirydate", "semexpirydate", "expiry", "expiry_date"])
-            symbol_col = self._col(["underlyingsymbol", "semunderlyingsymbol", "symbol", "semtrading_symbol", "semcustomsymbol", "customsymbol"])
+            expiry_col = self._col(["expirydate", "semexpirydate", "smexpirydate", "expiry", "expiry_date"])
+            symbol_col = self._col(["underlyingsymbol", "semunderlyingsymbol", "underlying_symbol", "symbol", "symbolname", "smsymbolname", "semtrading_symbol", "semcustomsymbol", "customsymbol", "displayname"])
             if expiry_col:
                 df = self.master
                 if symbol_col:
@@ -927,11 +1009,11 @@ class OptionContractResolver:
             return None
 
         id_col = self._col(["securityid", "security_id", "semsmstsecurityid", "instrumenttoken"])
-        expiry_col = self._col(["expirydate", "semexpirydate", "expiry", "expiry_date"])
+        expiry_col = self._col(["expirydate", "semexpirydate", "smexpirydate", "expiry", "expiry_date"])
         strike_col = self._col(["strikeprice", "semstrikeprice", "strike", "strike_price"])
         option_col = self._col(["optiontype", "semoptiontype", "option_type"])
-        symbol_col = self._col(["underlyingsymbol", "semunderlyingsymbol", "symbol", "semtrading_symbol", "semcustomsymbol", "customsymbol"])
-        custom_col = self._col(["customsymbol", "semcustomsymbol", "tradingsymbol", "trading_symbol", "symbolname"])
+        symbol_col = self._col(["underlyingsymbol", "semunderlyingsymbol", "underlying_symbol", "symbol", "symbolname", "smsymbolname", "semtrading_symbol", "semcustomsymbol", "customsymbol", "displayname"])
+        custom_col = self._col(["customsymbol", "semcustomsymbol", "displayname", "tradingsymbol", "trading_symbol", "symbolname", "smsymbolname"])
         instrument_col = self._col(["instrument", "instrumentname", "seminstrumentname"])
 
         if not id_col or not expiry_col or not strike_col:
@@ -1432,6 +1514,7 @@ class BrahmastraBacktester:
         self.resolver = resolver
         self.stop_event = stop_event
         self.option_cache: Dict[Tuple[int, str], pd.DataFrame] = {}
+        self.rolling_option_cache: Dict[Tuple[str, int, str], pd.DataFrame] = {}
         self.option_chain_cache: Dict[str, Optional[Dict[str, Any]]] = {}
         self.option_chain_errors: Dict[str, str] = {}
 
@@ -1489,8 +1572,22 @@ class BrahmastraBacktester:
         entry_time: dt.datetime,
     ) -> BacktestTrade:
         trade_date = entry_time.date()
-        expiry = self.resolver.pick_expiry_for_date(trade_date)
-        contract, option_df, entry_pos = self._select_historical_option(expiry, signal.side, float(index_df.iloc[entry_idx].open), entry_time)
+        try:
+            expiry = self.resolver.pick_expiry_for_date(trade_date)
+            contract, option_df, entry_pos = self._select_historical_option(expiry, signal.side, float(index_df.iloc[entry_idx].open), entry_time)
+        except Exception as exact_exc:
+            if not self.cfg.use_dhan_expired_options_api:
+                raise
+            try:
+                contract, option_df, entry_pos = self._select_rolling_historical_option(
+                    signal.side,
+                    float(index_df.iloc[entry_idx].open),
+                    entry_time,
+                )
+            except Exception as rolling_exc:
+                raise RuntimeError(
+                    f"{exact_exc}; Dhan expired-options rolling fallback also failed: {rolling_exc}"
+                ) from rolling_exc
         plan = make_option_plan(signal, index_df, signal_idx, contract, option_df.iloc[: entry_pos + 1], self.cfg)
         return self._simulate_option_trade(index_df, entry_idx, signal, option_df, entry_pos, plan)
 
@@ -1501,6 +1598,15 @@ class BrahmastraBacktester:
         start, end = day_start_end(day)
         df = self.api.option_intraday(security_id, start, end)
         self.option_cache[cache_key] = df
+        return df
+
+    def _rolling_option_day_df(self, side: str, strike_offset: int, day: dt.date) -> pd.DataFrame:
+        cache_key = (side.upper(), strike_offset, day.isoformat())
+        if cache_key in self.rolling_option_cache:
+            return self.rolling_option_cache[cache_key]
+        start, end = day_start_end(day)
+        df = self.api.rolling_option_intraday(side, strike_offset, start, end)
+        self.rolling_option_cache[cache_key] = df
         return df
 
     def _option_chain_for_security_ids(self, expiry: str, trade_date: dt.date) -> Optional[Dict[str, Any]]:
@@ -1589,6 +1695,71 @@ class BrahmastraBacktester:
             raise RuntimeError(
                 "No historical option candidate had an exact entry candle. "
                 f"Expiry={expiry}, time={entry_time}. Details: {detail}"
+            )
+
+        _, contract, option_df, entry_pos = sorted(choices, key=lambda x: x[0])[0]
+        return contract, option_df, entry_pos
+
+    def _select_rolling_historical_option(
+        self,
+        side: str,
+        spot_at_entry: float,
+        entry_time: dt.datetime,
+    ) -> Tuple[OptionContract, pd.DataFrame, int]:
+        candidates = strike_candidates(spot_at_entry, side, self.cfg, None)
+        atm = round(spot_at_entry / self.cfg.strike_step) * self.cfg.strike_step
+        choices: List[Tuple[Tuple[int, float, float], OptionContract, pd.DataFrame, int]] = []
+        failures: List[str] = []
+
+        for strike in candidates:
+            strike_offset = int(round((float(strike) - float(atm)) / self.cfg.strike_step))
+            if abs(strike_offset) > 10:
+                failures.append(f"{int(strike)} {side}: rolling offset ATM{strike_offset:+d} outside Dhan limit")
+                continue
+
+            try:
+                option_df = self._rolling_option_day_df(side, strike_offset, entry_time.date())
+                entry_pos = find_exact_candle(option_df, entry_time)
+                if entry_pos is None:
+                    failures.append(f"{int(strike)} {side}: no rolling candle at {entry_time.time()}")
+                    continue
+
+                entry_premium = float(option_df.iloc[entry_pos].open)
+                if entry_premium <= 0:
+                    failures.append(f"{int(strike)} {side}: invalid rolling premium {entry_premium}")
+                    continue
+                if not self.cfg.allow_premium_fallback and not (self.cfg.min_premium <= entry_premium <= self.cfg.max_premium):
+                    failures.append(f"{int(strike)} {side}: rolling premium {entry_premium:.2f} outside allowed range")
+                    continue
+
+                actual_strike = float(strike)
+                if "strike" in option_df.columns:
+                    api_strike = pd.to_numeric(pd.Series([option_df.iloc[entry_pos].strike]), errors="coerce").iloc[0]
+                    if pd.notna(api_strike) and float(api_strike) > 0:
+                        actual_strike = float(api_strike)
+
+                offset_label = "ATM" if strike_offset == 0 else f"ATM{strike_offset:+d}"
+                reason = (
+                    f"Dhan expired rolling option API {self.cfg.expired_options_expiry_flag} "
+                    f"expiryCode={self.cfg.expired_options_expiry_code} {offset_label}"
+                )
+                contract = OptionContract(
+                    side=side,
+                    strike=actual_strike,
+                    expiry=f"ROLLING-{self.cfg.expired_options_expiry_flag}-{self.cfg.expired_options_expiry_code}",
+                    security_id=0,
+                    entry_premium=entry_premium,
+                    selection_reason=reason,
+                )
+                choices.append((score_premium_choice(entry_premium, actual_strike, atm, self.cfg), contract, option_df, entry_pos))
+            except Exception as exc:
+                failures.append(f"{int(strike)} {side}: {exc}")
+
+        if not choices:
+            detail = "; ".join(failures[:4])
+            raise RuntimeError(
+                "No Dhan expired-options rolling candidate had an exact entry candle. "
+                f"time={entry_time}. Details: {detail}"
             )
 
         _, contract, option_df, entry_pos = sorted(choices, key=lambda x: x[0])[0]
