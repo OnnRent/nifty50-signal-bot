@@ -1,3 +1,4 @@
+
 """NIFTY Brahmastra option-buying bot with live alerts and premium backtests.
 
 What this program does
@@ -45,8 +46,8 @@ Useful optional variables
 - PREFERRED_PREMIUM_MIN=80
 - PREFERRED_PREMIUM_MAX=180
 - MAX_PREMIUM=250
-- LOT_SIZE=75
-- LOTS=1
+- LOT_SIZE=65
+- LOTS=2
 """
 
 from __future__ import annotations
@@ -170,8 +171,8 @@ class Config:
     nifty_sl_buffer: float = 10.0
     fallback_option_sl_pct: float = 0.20
 
-    lot_size: int = 75
-    lots: int = 1
+    lot_size: int = 65
+    lots: int = 2
     brokerage_per_order: float = 0.0
 
     square_off_time: dt.time = dt.time(15, 20)
@@ -230,8 +231,8 @@ class Config:
             option_sl_buffer=_env_float("OPTION_SL_BUFFER", 0.50),
             nifty_sl_buffer=_env_float("NIFTY_SL_BUFFER", 10.0),
             fallback_option_sl_pct=_env_float("FALLBACK_OPTION_SL_PCT", 0.20),
-            lot_size=_env_int("LOT_SIZE", 75),
-            lots=_env_int("LOTS", 1),
+            lot_size=_env_int("LOT_SIZE", 65),
+            lots=_env_int("LOTS", 2),
             brokerage_per_order=_env_float("BROKERAGE_PER_ORDER", 0.0),
             live_enabled_at_start=_env_bool("LIVE_ENABLED", True),
             dhan_scrip_master_csv=(os.getenv("DHAN_SCRIP_MASTER_CSV") or "").strip() or None,
