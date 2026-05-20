@@ -1,4 +1,5 @@
 """NIFTY50 signal bot with score-based BUY alerts and live auto orders.
+
 What this program does
 - NIFTY50 only
 - Live monitoring runs continuously in the background
@@ -31,6 +32,14 @@ Important note
 - This is a signal assistant, not financial advice.
 - Historical scan uses historical candles, but option-chain suggestion is based
   on the current Dhan option chain snapshot.
+
+Logging optional variables
+- LOG_LEVEL=INFO
+- LOG_DIR=logs
+- LOG_FILE=nifty50_signal_order_bot.log
+- LOG_TO_CONSOLE=true
+- LOG_HTTP_PAYLOADS=false
+- LOG_LIVE_SCAN_EVERY_SECONDS=0
 """
 
 from __future__ import annotations
@@ -39,6 +48,7 @@ import dataclasses
 import datetime as dt
 import html
 import json
+import logging
 import math
 import os
 import re
@@ -46,6 +56,8 @@ import statistics
 import threading
 import time
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -79,6 +91,10 @@ TG_POLL_INTERVAL_DEFAULT = float(os.getenv("TG_POLL_INTERVAL", "5"))
 ORDER_FILLED_STATUSES = {"TRADED"}
 ORDER_DEAD_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED"}
 
+LOGGER_NAME = "nifty50_signal_order_bot"
+LOG = logging.getLogger(LOGGER_NAME)
+SENSITIVE_KEY_RE = re.compile(r"(token|access|authorization|password|secret|chat[_-]?id|client[_-]?id|clientid|dhanclientid)", re.IGNORECASE)
+
 
 # -----------------------------------------------------------------------------
 # Config
@@ -108,6 +124,12 @@ class Config:
     order_status_poll_seconds: float = 1.0
     option_sl_buffer: float = 0.50
     square_off_time: dt.time = dt.time(15, 20)
+    log_level: str = "INFO"
+    log_dir: str = "logs"
+    log_file: str = "nifty50_signal_order_bot.log"
+    log_to_console: bool = True
+    log_http_payloads: bool = False
+    log_live_scan_every_seconds: float = 0.0
 
     @property
     def quantity(self) -> int:
@@ -137,6 +159,12 @@ class Config:
             except Exception:
                 return default
 
+        def _bool(name: str, default: bool) -> bool:
+            value = os.getenv(name)
+            if value is None:
+                return default
+            return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
         def _str(name: str, default: str) -> str:
             value = os.getenv(name)
             if value is None:
@@ -162,7 +190,80 @@ class Config:
             order_status_poll_attempts=_int("ORDER_STATUS_POLL_ATTEMPTS", 15),
             order_status_poll_seconds=_float("ORDER_STATUS_POLL_SECONDS", 1.0),
             option_sl_buffer=_float("OPTION_SL_BUFFER", 0.50),
+            log_level=_str("LOG_LEVEL", "INFO").upper(),
+            log_dir=_str("LOG_DIR", "logs"),
+            log_file=_str("LOG_FILE", "nifty50_signal_order_bot.log"),
+            log_to_console=_bool("LOG_TO_CONSOLE", True),
+            log_http_payloads=_bool("LOG_HTTP_PAYLOADS", False),
+            log_live_scan_every_seconds=_float("LOG_LIVE_SCAN_EVERY_SECONDS", 0.0),
         )
+
+
+def redact_for_log(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(k): "<redacted>" if SENSITIVE_KEY_RE.search(str(k)) else redact_for_log(v)
+            for k, v in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_for_log(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(redact_for_log(v) for v in value)
+    return value
+
+
+def log_json(value: Any, max_len: int = 3000) -> str:
+    try:
+        text = json.dumps(redact_for_log(value), ensure_ascii=True, default=str)
+    except Exception:
+        text = str(value)
+    if len(text) > max_len:
+        return text[:max_len] + "...<truncated>"
+    return text
+
+
+def setup_logging(cfg: Config) -> None:
+    level = getattr(logging, cfg.log_level.upper(), logging.INFO)
+    LOG.setLevel(level)
+    LOG.propagate = False
+
+    for handler in list(LOG.handlers):
+        LOG.removeHandler(handler)
+        handler.close()
+
+    log_dir = Path(cfg.log_dir).expanduser()
+    if not log_dir.is_absolute():
+        log_dir = Path(__file__).resolve().parent / log_dir
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_path = log_dir / cfg.log_file
+
+    formatter = logging.Formatter(
+        "%(asctime)s | %(levelname)s | %(threadName)s | %(name)s | %(message)s"
+    )
+
+    file_handler = RotatingFileHandler(
+        log_path,
+        maxBytes=5_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(level)
+    LOG.addHandler(file_handler)
+
+    if cfg.log_to_console:
+        console_handler = logging.StreamHandler()
+        console_handler.setFormatter(formatter)
+        console_handler.setLevel(level)
+        LOG.addHandler(console_handler)
+
+    LOG.info(
+        "Logging initialized | file=%s level=%s console=%s http_payloads=%s",
+        log_path,
+        cfg.log_level.upper(),
+        cfg.log_to_console,
+        cfg.log_http_payloads,
+    )
 
 
 # -----------------------------------------------------------------------------
@@ -276,6 +377,7 @@ class DhanApiClient:
                 "client-id": cfg.dhan_client_id,
             }
         )
+        LOG.debug("Dhan API client initialized | timeout=%s", cfg.http_timeout)
 
     @staticmethod
     def _response_body(r: requests.Response) -> str:
@@ -288,6 +390,12 @@ class DhanApiClient:
         if r.status_code < 400:
             return
         body = self._response_body(r)
+        LOG.error(
+            "Dhan API error | endpoint=%s status=%s body=%s",
+            endpoint,
+            r.status_code,
+            log_json(body),
+        )
         hint = ""
         if r.status_code == 401:
             hint = "\nHint: Dhan rejected authentication. Check DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN."
@@ -303,13 +411,17 @@ class DhanApiClient:
             "UnderlyingScrip": NIFTY50_SECURITY_ID,
             "UnderlyingSeg": NIFTY50_SEGMENT,
         }
+        if self.cfg.log_http_payloads:
+            LOG.debug("Dhan request | endpoint=/optionchain/expirylist payload=%s", log_json(payload))
         r = self.session.post(
             f"{DHAN_BASE}/optionchain/expirylist",
             data=json.dumps(payload),
             timeout=self.cfg.http_timeout,
         )
         self._raise_for_status(r, "/optionchain/expirylist")
-        return [str(x) for x in r.json().get("data", [])]
+        expiries = [str(x) for x in r.json().get("data", [])]
+        LOG.info("Fetched expiry list | count=%s", len(expiries))
+        return expiries
 
     def pick_expiry(self) -> str:
         expiries = self.expiry_list()
@@ -330,7 +442,9 @@ class DhanApiClient:
         for exp in future:
             d = parse_expiry(exp)
             if d >= today or d == dt.date.max:
+                LOG.info("Picked expiry | expiry=%s", exp)
                 return exp
+        LOG.info("Picked fallback expiry | expiry=%s", future[0])
         return future[0]
 
     def option_chain(self, expiry: str) -> Dict[str, Any]:
@@ -339,13 +453,24 @@ class DhanApiClient:
             "UnderlyingSeg": NIFTY50_SEGMENT,
             "Expiry": expiry,
         }
+        if self.cfg.log_http_payloads:
+            LOG.debug("Dhan request | endpoint=/optionchain payload=%s", log_json(payload))
         r = self.session.post(
             f"{DHAN_BASE}/optionchain",
             data=json.dumps(payload),
             timeout=self.cfg.http_timeout,
         )
         self._raise_for_status(r, "/optionchain")
-        return r.json()
+        data = r.json()
+        chain_data = data.get("data", {}) if isinstance(data, dict) else {}
+        oc = chain_data.get("oc") or {}
+        LOG.info(
+            "Fetched option chain | expiry=%s spot=%s strikes=%s",
+            expiry,
+            chain_data.get("last_price"),
+            len(oc),
+        )
+        return data
 
     def intraday_candles(
         self,
@@ -366,6 +491,17 @@ class DhanApiClient:
             "fromDate": from_date,
             "toDate": to_date,
         }
+        if self.cfg.log_http_payloads:
+            LOG.debug("Dhan request | endpoint=/charts/intraday payload=%s", log_json(payload))
+        LOG.debug(
+            "Fetching intraday candles | security_id=%s segment=%s instrument=%s interval=%s from=%s to=%s",
+            security_id,
+            exchange_segment,
+            instrument,
+            interval,
+            from_date,
+            to_date,
+        )
         r = self.session.post(
             f"{DHAN_BASE}/charts/intraday",
             data=json.dumps(payload),
@@ -376,9 +512,25 @@ class DhanApiClient:
         if isinstance(raw, dict) and "data" in raw:
             raw = raw["data"]
         if isinstance(raw, list):
-            return self._rows_to_df(raw)
+            df = self._rows_to_df(raw)
+            LOG.info(
+                "Fetched intraday candles | security_id=%s rows=%s from=%s to=%s",
+                security_id,
+                len(df),
+                from_date,
+                to_date,
+            )
+            return df
         if isinstance(raw, dict):
-            return self._dict_to_df(raw)
+            df = self._dict_to_df(raw)
+            LOG.info(
+                "Fetched intraday candles | security_id=%s rows=%s from=%s to=%s",
+                security_id,
+                len(df),
+                from_date,
+                to_date,
+            )
+            return df
         raise ValueError(f"Unexpected intraday response shape: {type(raw)}")
 
     def option_intraday(self, security_id: int, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
@@ -423,6 +575,17 @@ class DhanApiClient:
             "boProfitValue": 0.0,
             "boStopLossValue": 0.0,
         }
+        LOG.info(
+            "Placing order | txn=%s security_id=%s qty=%s type=%s trigger=%s correlation=%s",
+            payload["transactionType"],
+            security_id,
+            quantity,
+            payload["orderType"],
+            payload["triggerPrice"],
+            payload["correlationId"],
+        )
+        if self.cfg.log_http_payloads:
+            LOG.debug("Dhan request | endpoint=/orders payload=%s", log_json(payload))
         r = self.session.post(
             f"{DHAN_BASE}/orders",
             data=json.dumps(payload),
@@ -432,6 +595,11 @@ class DhanApiClient:
         data = r.json()
         if isinstance(data, dict):
             data["_request"] = payload
+        LOG.info(
+            "Order placed response | order_id=%s status=%s",
+            _order_id(data) if isinstance(data, dict) else None,
+            _order_status(data) if isinstance(data, dict) else "UNKNOWN",
+        )
         return data
 
     def modify_order(
@@ -455,6 +623,15 @@ class DhanApiClient:
             "triggerPrice": float(trigger_price or 0.0),
             "validity": (validity or self.cfg.order_validity).upper(),
         }
+        LOG.info(
+            "Modifying order | order_id=%s qty=%s type=%s trigger=%s",
+            order_id,
+            quantity,
+            payload["orderType"],
+            payload["triggerPrice"],
+        )
+        if self.cfg.log_http_payloads:
+            LOG.debug("Dhan request | endpoint=/orders/%s payload=%s", order_id, log_json(payload))
         r = self.session.put(
             f"{DHAN_BASE}/orders/{order_id}",
             data=json.dumps(payload),
@@ -464,17 +641,27 @@ class DhanApiClient:
         data = r.json()
         if isinstance(data, dict):
             data["_request"] = payload
+        LOG.info(
+            "Order modify response | order_id=%s status=%s",
+            _order_id(data) if isinstance(data, dict) else order_id,
+            _order_status(data) if isinstance(data, dict) else "UNKNOWN",
+        )
         return data
 
     def cancel_order(self, order_id: str) -> Dict[str, Any]:
+        LOG.info("Cancelling order | order_id=%s", order_id)
         r = self.session.delete(
             f"{DHAN_BASE}/orders/{order_id}",
             timeout=self.cfg.http_timeout,
         )
         self._raise_for_status(r, f"/orders/{order_id}")
         if not (r.text or "").strip():
-            return {"orderId": str(order_id), "orderStatus": "CANCELLED"}
-        return r.json()
+            data = {"orderId": str(order_id), "orderStatus": "CANCELLED"}
+            LOG.info("Order cancel response | order_id=%s status=%s", order_id, _order_status(data))
+            return data
+        data = r.json()
+        LOG.info("Order cancel response | order_id=%s status=%s", order_id, _order_status(data))
+        return data
 
     def get_order(self, order_id: str) -> Dict[str, Any]:
         r = self.session.get(
@@ -482,7 +669,15 @@ class DhanApiClient:
             timeout=self.cfg.http_timeout,
         )
         self._raise_for_status(r, f"/orders/{order_id}")
-        return r.json()
+        data = r.json()
+        LOG.debug(
+            "Fetched order | order_id=%s status=%s filled=%s remaining=%s",
+            order_id,
+            _order_status(data),
+            _order_filled_qty(data),
+            _order_remaining_qty(data),
+        )
+        return data
 
     @staticmethod
     def _rows_to_df(rows: List[Dict[str, Any]]) -> pd.DataFrame:
@@ -550,8 +745,10 @@ class TelegramBot:
         self.timeout = timeout
         self.session = requests.Session()
         self._offset = 0
+        LOG.debug("Telegram client initialized | timeout=%s", timeout)
 
     def send(self, text: str) -> None:
+        LOG.debug("Sending Telegram message | chars=%s", len(text))
         self.session.post(
             f"{TELEGRAM_BASE}/bot{self.token}/sendMessage",
             data={
@@ -562,6 +759,7 @@ class TelegramBot:
             },
             timeout=self.timeout,
         ).raise_for_status()
+        LOG.info("Telegram message sent | chars=%s", len(text))
 
     def get_messages(self) -> List[str]:
         try:
@@ -572,6 +770,7 @@ class TelegramBot:
             )
             r.raise_for_status()
         except Exception:
+            LOG.exception("Telegram getUpdates failed")
             return []
 
         texts: List[str] = []
@@ -582,6 +781,8 @@ class TelegramBot:
             text = (msg.get("text") or "").strip()
             if chat_id == self.chat_id and text:
                 texts.append(text)
+        if texts:
+            LOG.info("Telegram messages received | count=%s commands=%s", len(texts), texts)
         return texts
 
 
@@ -893,8 +1094,11 @@ def detect_patterns(df: pd.DataFrame) -> List[str]:
                     matches.append(name)
             except Exception:
                 continue
+        if matches:
+            LOG.debug("Detected TA-Lib patterns | candle=%s patterns=%s", df.iloc[-1].timestamp, matches)
         return matches
     except Exception:
+        LOG.debug("TA-Lib unavailable or failed; using fallback pattern detection")
         last = df.iloc[-1]
         prev = df.iloc[-2]
         body = abs(last.close - last.open)
@@ -913,6 +1117,8 @@ def detect_patterns(df: pd.DataFrame) -> List[str]:
             matches.append("CDLENGULFING")
         if body / rng <= 0.1:
             matches.append("CDLDOJI")
+        if matches:
+            LOG.debug("Detected fallback patterns | candle=%s patterns=%s", df.iloc[-1].timestamp, matches)
         return matches
 
 
@@ -1117,8 +1323,22 @@ def build_signal(
 
     direction, score, max_score, reasons = score_setup(window, chain, ctx, patterns)
     if direction == "NEUTRAL":
+        LOG.debug(
+            "Signal rejected | candle=%s reason=neutral_direction patterns=%s",
+            ctx.last_candle.ts,
+            patterns,
+        )
         return None
     if score < MIN_SIGNAL_SCORE:
+        LOG.debug(
+            "Signal rejected | candle=%s direction=%s score=%s/%s threshold=%s patterns=%s",
+            ctx.last_candle.ts,
+            direction,
+            score,
+            max_score,
+            MIN_SIGNAL_SCORE,
+            patterns,
+        )
         return None
 
     bullish = direction == "BULLISH"
@@ -1131,6 +1351,17 @@ def build_signal(
     _, _, _, option_plan = _option_trade_plan(chain, spot, side, score)
 
     confidence = _signal_confidence(score, max_score)
+    LOG.info(
+        "Signal accepted | candle=%s direction=%s score=%s/%s confidence=%s side=%s strike=%s option_id=%s",
+        ctx.last_candle.ts,
+        direction,
+        score,
+        max_score,
+        confidence,
+        side,
+        option_plan.strike,
+        option_plan.option_security_id,
+    )
 
     return Signal(
         timestamp=_now_ist().isoformat(timespec="seconds"),
@@ -1385,10 +1616,19 @@ class MarketWatchAgent:
         self.scan_thread: Optional[threading.Thread] = None
         self.scan_stop_event = threading.Event()
         self.scan_lock = threading.Lock()
+        self._last_live_scan_log_at: Optional[float] = None
+        LOG.info(
+            "MarketWatchAgent initialized | live_enabled=%s quantity=%s threshold=%s poll_interval=%s",
+            self.live_enabled,
+            self.cfg.quantity,
+            MIN_SIGNAL_SCORE,
+            self.cfg.tg_poll_interval,
+        )
 
     def _ensure_expiry(self) -> str:
         if self.expiry is None:
             self.expiry = self.api.pick_expiry()
+            LOG.info("Cached active expiry | expiry=%s", self.expiry)
         return self.expiry
 
     def _fetch_chain(self) -> Tuple[str, float, Dict[str, Any]]:
@@ -1398,11 +1638,13 @@ class MarketWatchAgent:
         spot = _num(data.get("last_price"))
         oc: Dict[str, Any] = data.get("oc") or {}
         if not oc:
+            LOG.warning("Fetched empty option chain | expiry=%s spot=%s", expiry, spot)
             raise RuntimeError("Empty option chain — market may be closed.")
+        LOG.info("Chain snapshot ready | expiry=%s spot=%s strikes=%s", expiry, spot, len(oc))
         return expiry, spot, oc
 
     def _fetch_intraday(self, start: dt.datetime, end: dt.datetime) -> pd.DataFrame:
-        return self.api.intraday_candles(
+        df = self.api.intraday_candles(
             security_id=NIFTY50_SECURITY_ID,
             exchange_segment=NIFTY50_SEGMENT,
             instrument="INDEX",
@@ -1411,6 +1653,8 @@ class MarketWatchAgent:
             to_date=end.strftime("%Y-%m-%d %H:%M:%S"),
             oi=True,
         )
+        LOG.debug("Index intraday fetched | rows=%s start=%s end=%s", len(df), start, end)
+        return df
 
     def _current_intraday(self) -> pd.DataFrame:
         now = _now_ist()
@@ -1427,26 +1671,57 @@ class MarketWatchAgent:
         msg = format_signal(signal)
         if prefix:
             msg = f"{prefix}\n\n{msg}"
+        LOG.info(
+            "Sending signal alert | prefix=%s candle=%s direction=%s score=%s/%s option=%s %s",
+            prefix or "-",
+            signal.candle_time,
+            signal.direction,
+            signal.score,
+            signal.max_score,
+            signal.option_plan.side,
+            signal.option_plan.strike,
+        )
         self.bot.send(msg)
 
     # Live order helpers
 
     def _wait_for_order_update(self, order_id_value: str, attempts: Optional[int] = None) -> Dict[str, Any]:
         attempts = attempts or self.cfg.order_status_poll_attempts
+        LOG.info("Waiting for order update | order_id=%s attempts=%s", order_id_value, attempts)
         latest: Dict[str, Any] = {"orderId": order_id_value, "orderStatus": "UNKNOWN"}
-        for _ in range(max(1, attempts)):
+        for attempt in range(max(1, attempts)):
             latest = self.api.get_order(order_id_value)
             status = _order_status(latest)
+            LOG.debug(
+                "Order poll | order_id=%s attempt=%s/%s status=%s filled=%s remaining=%s",
+                order_id_value,
+                attempt + 1,
+                attempts,
+                status,
+                _order_filled_qty(latest),
+                _order_remaining_qty(latest),
+            )
             if status in ORDER_FILLED_STATUSES or status in ORDER_DEAD_STATUSES:
+                LOG.info("Order reached terminal status | order_id=%s status=%s", order_id_value, status)
                 return latest
             if status == "PART_TRADED" and _order_remaining_qty(latest) == 0:
+                LOG.info("Order part-traded with zero remaining | order_id=%s", order_id_value)
                 return latest
             time.sleep(max(0.1, self.cfg.order_status_poll_seconds))
+        LOG.warning("Order polling ended before terminal status | order_id=%s status=%s", order_id_value, _order_status(latest))
         return latest
 
     def _place_market_exit(self, position: LivePosition, quantity: int, reason: str) -> Optional[Dict[str, Any]]:
         if quantity <= 0:
+            LOG.info("Market exit skipped | reason=%s quantity=%s", reason, quantity)
             return None
+        LOG.info(
+            "Placing market exit | reason=%s security_id=%s quantity=%s remaining_before=%s",
+            reason,
+            position.plan.option_security_id,
+            quantity,
+            position.remaining_qty,
+        )
         order = self.api.place_order(
             transaction_type="SELL",
             security_id=int(position.plan.option_security_id or 0),
@@ -1467,19 +1742,39 @@ class MarketWatchAgent:
             latest_status = _order_status(latest)
             if latest_status != status:
                 self.bot.send(format_order_update(f"EXIT ORDER UPDATE - {reason}", position, latest))
+            LOG.info(
+                "Market exit update | reason=%s order_id=%s status=%s",
+                reason,
+                exit_order_id,
+                latest_status,
+            )
             return latest
         return order
 
     def _place_or_modify_stop_order(self, position: LivePosition, quantity: int, trigger_price: float, reason: str) -> None:
         trigger_price = round(max(float(trigger_price), 0.05), 2)
         if quantity <= 0:
+            LOG.info(
+                "Stop order not needed | reason=%s quantity=%s existing_stop=%s",
+                reason,
+                quantity,
+                position.stop_order_id,
+            )
             if position.stop_order_id and position.stop_order_status not in ORDER_DEAD_STATUSES | ORDER_FILLED_STATUSES:
                 cancelled = self.api.cancel_order(position.stop_order_id)
                 position.stop_order_status = _order_status(cancelled)
                 self.bot.send(format_order_update(f"SL ORDER CANCELLED - {reason}", position, cancelled))
+                LOG.info("Stop order cancelled after zero quantity | stop_order_id=%s status=%s", position.stop_order_id, position.stop_order_status)
             return
 
         if position.stop_order_id and position.stop_order_status not in ORDER_DEAD_STATUSES | ORDER_FILLED_STATUSES:
+            LOG.info(
+                "Modifying stop order | reason=%s stop_order_id=%s quantity=%s trigger=%s",
+                reason,
+                position.stop_order_id,
+                quantity,
+                trigger_price,
+            )
             modified = self.api.modify_order(
                 position.stop_order_id,
                 quantity=quantity,
@@ -1491,8 +1786,16 @@ class MarketWatchAgent:
             position.stop_order_status = _order_status(modified)
             position.current_sl = trigger_price
             self.bot.send(format_order_update(f"SL ORDER MODIFIED - {reason}", position, modified))
+            LOG.info("Stop order modified | stop_order_id=%s status=%s", position.stop_order_id, position.stop_order_status)
             return
 
+        LOG.info(
+            "Placing stop order | reason=%s security_id=%s quantity=%s trigger=%s",
+            reason,
+            position.plan.option_security_id,
+            quantity,
+            trigger_price,
+        )
         placed = self.api.place_order(
             transaction_type="SELL",
             security_id=int(position.plan.option_security_id or 0),
@@ -1508,9 +1811,11 @@ class MarketWatchAgent:
         position.stop_order_status = _order_status(placed)
         position.current_sl = trigger_price
         self.bot.send(format_order_update(f"SL ORDER PLACED - {reason}", position, placed))
+        LOG.info("Stop order placed | stop_order_id=%s status=%s", position.stop_order_id, position.stop_order_status)
 
     def _sync_stop_order(self, position: LivePosition) -> bool:
         if not position.stop_order_id:
+            LOG.debug("Stop sync skipped | no stop order")
             return True
         previous_status = position.stop_order_status
         latest = self.api.get_order(position.stop_order_id)
@@ -1519,6 +1824,13 @@ class MarketWatchAgent:
         if status != previous_status:
             position.stop_order_status = status
             self.bot.send(format_order_update("SL ORDER STATUS UPDATE", position, latest))
+            LOG.info(
+                "Stop order status changed | stop_order_id=%s from=%s to=%s remaining=%s",
+                position.stop_order_id,
+                previous_status,
+                status,
+                remaining_after_stop,
+            )
         if status in ORDER_FILLED_STATUSES or (status == "PART_TRADED" and remaining_after_stop == 0):
             position.remaining_qty = 0
             self.bot.send(
@@ -1530,9 +1842,11 @@ class MarketWatchAgent:
                     _now_ist().replace(tzinfo=None),
                 )
             )
+            LOG.info("Stop order executed | stop_order_id=%s status=%s", position.stop_order_id, status)
             return False
         if status == "PART_TRADED" and remaining_after_stop > 0:
             position.remaining_qty = remaining_after_stop
+            LOG.info("Stop order part traded | stop_order_id=%s remaining=%s", position.stop_order_id, remaining_after_stop)
         if status in ORDER_DEAD_STATUSES and position.remaining_qty > 0 and status != previous_status:
             self.bot.send(
                 format_order_update(
@@ -1542,10 +1856,12 @@ class MarketWatchAgent:
                     "The position still has remaining quantity, but the protective SL order is not active.",
                 )
             )
+            LOG.warning("Stop order dead while position remains | stop_order_id=%s status=%s remaining=%s", position.stop_order_id, status, position.remaining_qty)
         return True
 
     def _sync_entry_order(self, position: LivePosition) -> bool:
         if not position.entry_order_id:
+            LOG.warning("Entry sync failed | missing entry order id")
             return False
         latest = self.api.get_order(position.entry_order_id)
         status = _order_status(latest)
@@ -1559,23 +1875,34 @@ class MarketWatchAgent:
             if avg_price > 0:
                 position.entry_avg_price = avg_price
             self.bot.send(format_order_update("ENTRY ORDER STATUS UPDATE", position, latest))
+            LOG.info(
+                "Entry order status changed | entry_order_id=%s status=%s filled=%s avg=%s",
+                position.entry_order_id,
+                status,
+                filled_qty,
+                avg_price,
+            )
             if filled_qty > previous_filled_qty and position.stop_order_id is not None:
                 additional_qty = filled_qty - previous_filled_qty
                 position.remaining_qty += additional_qty
+                LOG.info("Additional entry fill detected | qty=%s remaining=%s", additional_qty, position.remaining_qty)
                 self._place_or_modify_stop_order(position, position.remaining_qty, position.current_sl, "additional entry fill")
 
         if filled_qty > 0 and position.stop_order_id is None:
             position.remaining_qty = filled_qty
+            LOG.info("Entry filled; placing protective stop | filled=%s sl=%s", filled_qty, position.current_sl)
             self._place_or_modify_stop_order(position, position.remaining_qty, position.current_sl, "entry filled")
 
         if status in ORDER_DEAD_STATUSES and filled_qty <= 0:
             self.bot.send(format_order_update("ENTRY ORDER CLOSED WITHOUT FILL", position, latest))
+            LOG.warning("Entry order closed without fill | entry_order_id=%s status=%s", position.entry_order_id, status)
             return False
         return True
 
     def _open_live_position(self, expiry: str, signal: Signal) -> None:
         plan = signal.option_plan
         if plan.option_security_id is None:
+            LOG.warning("Live entry skipped | missing option security id candle=%s", signal.candle_time)
             self.bot.send(
                 "<b>ENTRY ORDER SKIPPED</b>\n"
                 "No option security id was available in the Dhan option-chain snapshot."
@@ -1585,6 +1912,7 @@ class MarketWatchAgent:
         signal_ts = pd.Timestamp(signal.candle_time)
         for position in self.live_positions:
             if pd.Timestamp(position.signal.candle_time) == signal_ts and position.signal.direction == signal.direction:
+                LOG.info("Duplicate live position skipped | candle=%s direction=%s", signal.candle_time, signal.direction)
                 return
 
         position = LivePosition(
@@ -1594,6 +1922,15 @@ class MarketWatchAgent:
             current_sl=plan.stop_loss,
             remaining_qty=0,
             last_checked_option_ts=signal_ts,
+        )
+        LOG.info(
+            "Opening live position | expiry=%s direction=%s option=%s %s security_id=%s qty=%s",
+            expiry,
+            signal.direction,
+            plan.side,
+            plan.strike,
+            plan.option_security_id,
+            self.cfg.quantity,
         )
 
         entry_order = self.api.place_order(
@@ -1624,14 +1961,22 @@ class MarketWatchAgent:
                 position.remaining_qty = position.entry_filled_qty
                 self._place_or_modify_stop_order(position, position.remaining_qty, position.current_sl, "entry filled")
             elif position.entry_order_status in ORDER_DEAD_STATUSES:
+                LOG.warning(
+                    "Live position not tracked after dead entry | order_id=%s status=%s",
+                    position.entry_order_id,
+                    position.entry_order_status,
+                )
                 return
 
         self.live_positions.append(position)
+        LOG.info("Live position tracked | entry_order_id=%s active_positions=%s", position.entry_order_id, len(self.live_positions))
 
     def _cancel_stop_before_exit(self, position: LivePosition, reason: str) -> None:
         if not position.stop_order_id:
+            LOG.info("Stop cancel skipped | reason=%s no stop order", reason)
             return
         if position.stop_order_status in ORDER_DEAD_STATUSES | ORDER_FILLED_STATUSES:
+            LOG.info("Stop cancel skipped | reason=%s stop_order_id=%s status=%s", reason, position.stop_order_id, position.stop_order_status)
             return
         latest = self.api.get_order(position.stop_order_id)
         latest_status = _order_status(latest)
@@ -1639,40 +1984,57 @@ class MarketWatchAgent:
         if latest_status in ORDER_FILLED_STATUSES or (latest_status == "PART_TRADED" and _order_remaining_qty(latest) == 0):
             position.remaining_qty = 0
             self.bot.send(format_order_update("SL ORDER ALREADY EXECUTED", position, latest))
+            LOG.info("Stop already executed before exit | stop_order_id=%s status=%s", position.stop_order_id, latest_status)
             return
         if latest_status == "PART_TRADED":
             position.remaining_qty = _order_remaining_qty(latest)
+            LOG.info("Stop part traded before exit | stop_order_id=%s remaining=%s", position.stop_order_id, position.remaining_qty)
         if latest_status in ORDER_DEAD_STATUSES:
+            LOG.info("Stop cancel skipped | reason=%s stop_order_id=%s latest_status=%s", reason, position.stop_order_id, latest_status)
             return
+        LOG.info("Cancelling stop before exit | reason=%s stop_order_id=%s", reason, position.stop_order_id)
         cancelled = self.api.cancel_order(position.stop_order_id)
         position.stop_order_status = _order_status(cancelled)
         self.bot.send(format_order_update(f"SL ORDER CANCELLED - {reason}", position, cancelled))
 
     def _track_live_position(self, candles: pd.DataFrame, position: LivePosition) -> bool:
+        LOG.debug(
+            "Tracking live position | entry_order_id=%s option=%s %s remaining=%s",
+            position.entry_order_id,
+            position.plan.side,
+            position.plan.strike,
+            position.remaining_qty,
+        )
         if not self._sync_entry_order(position):
+            LOG.info("Live position closed from tracking | reason=entry_sync_false entry_order_id=%s", position.entry_order_id)
             return False
         if position.entry_filled_qty <= 0:
             return True
         if not self._sync_stop_order(position):
+            LOG.info("Live position closed from tracking | reason=stop_sync_false entry_order_id=%s", position.entry_order_id)
             return False
 
         plan = position.plan
         if plan.option_security_id is None:
+            LOG.warning("Live position missing option security id during tracking")
             return False
 
         start, end = _day_start_end(_today_ist())
         option_df = self.api.option_intraday(int(plan.option_security_id), start, end)
         option_df = _closed_candles_only(option_df, 5)
         if option_df.empty:
+            LOG.debug("No option candles available for live position | security_id=%s", plan.option_security_id)
             return True
 
         index_by_ts = {pd.Timestamp(row.timestamp): i for i, row in candles.iterrows()}
         last_ts = position.last_checked_option_ts or pd.Timestamp(position.signal.candle_time)
         new_rows = option_df[option_df["timestamp"] > last_ts].reset_index(drop=True)
         if new_rows.empty:
+            LOG.debug("No new option candles for live position | security_id=%s last_ts=%s", plan.option_security_id, last_ts)
             return True
 
         half_qty = max(1, self.cfg.quantity // 2)
+        LOG.info("Processing option candles for live position | new_rows=%s last_ts=%s", len(new_rows), last_ts)
 
         for _, row in new_rows.iterrows():
             row_ts = pd.Timestamp(row.timestamp)
@@ -1685,6 +2047,7 @@ class MarketWatchAgent:
                 return False
 
             if row.timestamp.time() >= self.cfg.square_off_time:
+                LOG.info("Square-off time reached | row_time=%s remaining=%s", row.timestamp, position.remaining_qty)
                 self._cancel_stop_before_exit(position, "15:20 square-off")
                 if position.remaining_qty > 0:
                     self._place_market_exit(position, position.remaining_qty, "15:20 square-off")
@@ -1702,6 +2065,7 @@ class MarketWatchAgent:
                 return False
 
             if low <= position.current_sl:
+                LOG.info("Stop-loss touched in option candle | time=%s low=%s sl=%s", row.timestamp, low, position.current_sl)
                 self.bot.send(
                     format_live_position_update(
                         position,
@@ -1714,6 +2078,7 @@ class MarketWatchAgent:
                 return self._sync_stop_order(position)
 
             if not position.t1_hit and high >= plan.target1:
+                LOG.info("Target 1 hit | time=%s high=%s target1=%s remaining=%s", row.timestamp, high, plan.target1, position.remaining_qty)
                 booked_qty = min(half_qty, position.remaining_qty)
                 old_remaining = position.remaining_qty
                 new_remaining = position.remaining_qty - booked_qty
@@ -1724,10 +2089,12 @@ class MarketWatchAgent:
                         self._place_market_exit(position, booked_qty, "target 1")
                         position.remaining_qty = new_remaining
                 except Exception:
+                    LOG.exception("Target 1 handling failed; attempting restore")
                     position.remaining_qty = old_remaining
                     try:
                         self._place_or_modify_stop_order(position, old_remaining, position.current_sl, "restore after target 1 exit error")
                     except Exception:
+                        LOG.exception("Could not restore stop order after target 1 error")
                         pass
                     raise
                 position.t1_hit = True
@@ -1745,6 +2112,7 @@ class MarketWatchAgent:
                     return False
 
             if position.t1_hit and high >= plan.target2:
+                LOG.info("Target 2 hit | time=%s high=%s target2=%s remaining=%s", row.timestamp, high, plan.target2, position.remaining_qty)
                 self._cancel_stop_before_exit(position, "target 2")
                 if position.remaining_qty > 0:
                     self._place_market_exit(position, position.remaining_qty, "target 2")
@@ -1766,6 +2134,7 @@ class MarketWatchAgent:
                     prev_low = float(prev_rows.iloc[-1].low)
                     new_sl = max(position.current_sl, round(prev_low - self.cfg.option_sl_buffer, 2), plan.entry)
                     if new_sl > position.current_sl:
+                        LOG.info("Trailing stop | time=%s old_sl=%s new_sl=%s prev_low=%s", row.timestamp, position.current_sl, new_sl, prev_low)
                         self._place_or_modify_stop_order(position, position.remaining_qty, new_sl, "previous option candle low trail")
                         self.bot.send(
                             format_live_position_update(
@@ -1782,6 +2151,13 @@ class MarketWatchAgent:
                 chain = self.api.option_chain(position.expiry)
                 opposite = build_signal(position.expiry, candles.reset_index(drop=True), idx, chain)
                 if opposite is not None and opposite.direction != position.signal.direction:
+                    LOG.info(
+                        "Opposite signal exit | time=%s original=%s opposite=%s remaining=%s",
+                        row.timestamp,
+                        position.signal.direction,
+                        opposite.direction,
+                        position.remaining_qty,
+                    )
                     self._cancel_stop_before_exit(position, "opposite scored signal")
                     if position.remaining_qty > 0:
                         action = "EXIT FULL" if not position.t1_hit else "EXIT REMAINING"
@@ -1804,6 +2180,7 @@ class MarketWatchAgent:
     def _track_live_positions(self, candles: pd.DataFrame) -> None:
         if not self.live_positions:
             return
+        LOG.debug("Tracking live positions | count=%s", len(self.live_positions))
         still_open: List[LivePosition] = []
         for position in list(self.live_positions):
             try:
@@ -1811,22 +2188,27 @@ class MarketWatchAgent:
                     still_open.append(position)
             except Exception as exc:
                 print(f"Live position tracking error: {exc}")
+                LOG.exception("Live position tracking error")
                 self.bot.send(f"<b>Live position tracking error</b>\n{_escape(exc)}")
                 still_open.append(position)
         self.live_positions = still_open
+        LOG.debug("Live positions after tracking | count=%s", len(self.live_positions))
 
     # Live monitoring
 
     def _live_check(self) -> None:
         if not self.live_enabled:
+            LOG.debug("Live check skipped | live disabled")
             return
         if not _market_session_open():
+            LOG.debug("Live check skipped | market session closed")
             return
 
         expiry = self._ensure_expiry()
         candles = self._current_intraday()
         candles = _closed_candles_only(candles, 5)
         if candles.empty or len(candles) < 5:
+            LOG.debug("Live check skipped | insufficient candles rows=%s", len(candles))
             return
 
         self._track_live_positions(candles.reset_index(drop=True))
@@ -1834,19 +2216,33 @@ class MarketWatchAgent:
         latest = candles.iloc[-1]
         candle_time = str(latest.timestamp)
         if candle_time == self.last_live_candle_time:
+            LOG.debug("Live check skipped | candle already processed candle=%s", candle_time)
             return
 
         chain = self.api.option_chain(expiry)
         signal = build_signal(expiry, candles.reset_index(drop=True), len(candles) - 1, chain)
         self.last_live_candle_time = candle_time
+        now_monotonic = time.monotonic()
+        if (
+            self.cfg.log_live_scan_every_seconds > 0
+            and (
+                self._last_live_scan_log_at is None
+                or now_monotonic - self._last_live_scan_log_at >= self.cfg.log_live_scan_every_seconds
+            )
+        ):
+            self._last_live_scan_log_at = now_monotonic
+            LOG.info("Live scan heartbeat | candle=%s rows=%s signal=%s", candle_time, len(candles), signal is not None)
 
         if signal is None:
+            LOG.debug("Live check complete | no signal candle=%s", candle_time)
             return
 
         key = f"{signal.candle_time}|{signal.direction}|{','.join(signal.pattern_names)}"
         if key == self.last_live_key:
+            LOG.info("Live signal skipped | duplicate key=%s", key)
             return
 
+        LOG.info("Live signal firing | key=%s", key)
         self._send_signal(signal, prefix="<b>LIVE ALERT</b>")
         self._open_live_position(expiry, signal)
         self.last_live_key = key
@@ -1855,6 +2251,7 @@ class MarketWatchAgent:
 
     def _scan_worker(self, start_date: str, end_date: str) -> None:
         try:
+            LOG.info("Scan worker started | start=%s end=%s", start_date, end_date)
             expiry = self._ensure_expiry()
             self.bot.send(
                 f"⏳ Backtesting {NIFTY50_NAME} 5-minute candles\n"
@@ -1874,15 +2271,18 @@ class MarketWatchAgent:
             )
 
             if candles.empty:
+                LOG.warning("Scan returned no candles | start=%s end=%s", start_date, end_date)
                 self.bot.send("⚠️ No candles returned for that range.")
                 return
 
             chain = self.api.option_chain(expiry)
             last_key: Optional[str] = None
             sent = 0
+            LOG.info("Scan data ready | candles=%s expiry=%s", len(candles), expiry)
 
             for idx in range(4, len(candles)):
                 if self.scan_stop_event.is_set():
+                    LOG.info("Scan stopped by user | start=%s end=%s alerts_sent=%s", start_date, end_date, sent)
                     self.bot.send("🛑 Scan stopped by user.")
                     return
 
@@ -1895,22 +2295,33 @@ class MarketWatchAgent:
                 if key == last_key:
                     continue
 
+                LOG.info(
+                    "Backtest alert | candle=%s direction=%s score=%s/%s",
+                    signal.candle_time,
+                    signal.direction,
+                    signal.score,
+                    signal.max_score,
+                )
                 self._send_signal(signal, prefix="<b>BACKTEST ALERT</b>")
                 last_key = key
                 sent += 1
                 time.sleep(0.3)
 
             self.bot.send(f"✅ Scan completed. Sent {sent} alert(s).")
+            LOG.info("Scan completed | start=%s end=%s alerts_sent=%s", start_date, end_date, sent)
         except Exception as e:
+            LOG.exception("Scan error | start=%s end=%s", start_date, end_date)
             self.bot.send(f"⚠️ Scan error: {_escape(e)}")
         finally:
             self.scan_stop_event.clear()
             with self.scan_lock:
                 self.scan_thread = None
+            LOG.info("Scan worker cleaned up | start=%s end=%s", start_date, end_date)
 
     def _start_scan(self, start_date: str, end_date: str) -> None:
         with self.scan_lock:
             if self.scan_thread is not None and self.scan_thread.is_alive():
+                LOG.warning("Scan start rejected | already running start=%s end=%s", start_date, end_date)
                 self.bot.send("⚠️ A scan is already running.")
                 return
             self.scan_stop_event.clear()
@@ -1920,10 +2331,12 @@ class MarketWatchAgent:
                 daemon=True,
             )
             self.scan_thread.start()
+            LOG.info("Scan thread started | start=%s end=%s thread=%s", start_date, end_date, self.scan_thread.name)
 
     # Commands
 
     def _handle_chain(self) -> None:
+        LOG.info("Handling chain command")
         expiry, spot, oc = self._fetch_chain()
         all_strikes = sorted(float(k) for k in oc.keys())
         atm = _nearest_strike(all_strikes, spot)
@@ -1934,6 +2347,7 @@ class MarketWatchAgent:
         self.bot.send(format_chain_message(rows, spot, expiry, support, resistance, atm, pcr_val, max_pain_val))
 
     def _handle_status(self) -> None:
+        LOG.info("Handling status command")
         expiry, spot, oc = self._fetch_chain()
         all_strikes = sorted(float(k) for k in oc.keys())
         atm = _nearest_strike(all_strikes, spot)
@@ -1945,11 +2359,13 @@ class MarketWatchAgent:
         self.bot.send(format_status_message(spot, expiry, support, resistance, atm, pcr_val, max_pain_val, call_top, put_top))
 
     def _handle_strike(self, side: str, strike: float) -> None:
+        LOG.info("Handling strike command | side=%s strike=%s", side, strike)
         expiry, spot, oc = self._fetch_chain()
         row = _get_row(oc, strike)
         option_data = row.get(side.lower(), {})
         if not row:
             strikes = sorted(float(k) for k in oc.keys())
+            LOG.warning("Strike not found | side=%s strike=%s min=%s max=%s", side, strike, strikes[0], strikes[-1])
             self.bot.send(
                 f"⚠️ Strike <b>{strike:,.0f}</b> not found in the option chain.\n"
                 f"Range: {strikes[0]:,.0f} – {strikes[-1]:,.0f}"
@@ -1961,6 +2377,7 @@ class MarketWatchAgent:
 
         candles = self._current_intraday()
         if candles.empty or len(candles) < 5:
+            LOG.warning("Strike analysis failed | insufficient candles rows=%s", len(candles))
             self.bot.send("⚠️ Could not fetch intraday candles for strike analysis.")
             return
 
@@ -1976,6 +2393,7 @@ class MarketWatchAgent:
             for row in candles.itertuples(index=False)
         ])
         if ctx is None:
+            LOG.warning("Strike analysis failed | intraday context unavailable")
             self.bot.send("⚠️ Intraday context unavailable.")
             return
 
@@ -2008,10 +2426,12 @@ class MarketWatchAgent:
             confidence="Manual",
         )
         self._send_signal(signal, prefix="<b>STRIKE SNAPSHOT</b>")
+        LOG.info("Strike snapshot sent | side=%s strike=%s option_id=%s", side, strike, opt_id)
 
     def _dispatch(self, raw: str) -> None:
         text = raw.strip()
         cmd = text.split("@")[0].lower()
+        LOG.info("Dispatching command | text=%s", text)
 
         m = STRIKE_RE.match(text.replace(" ", ""))
         if m:
@@ -2025,11 +2445,13 @@ class MarketWatchAgent:
 
         if STOP_RE.match(text):
             self.scan_stop_event.set()
+            LOG.info("Stop requested via command")
             self.bot.send("🛑 Stop requested.")
             return
 
         if LIVE_RE.match(text):
             self.live_enabled = True
+            LOG.info("Live monitoring enabled via command")
             self.bot.send("✅ Live monitoring enabled. Real Dhan orders will be placed on live alerts.")
             return
 
@@ -2044,12 +2466,14 @@ class MarketWatchAgent:
         elif cmd in ("/help", "help", "/start", "start"):
             self.bot.send(HELP_TEXT)
         else:
+            LOG.warning("Unknown command | text=%s", text)
             self.bot.send(f"Unknown command: <code>{_escape(text)}</code>\n\n{HELP_TEXT}")
 
     # Run loop
 
     def run(self) -> None:
         print(f"Market Watch Agent started | {NIFTY50_NAME}")
+        LOG.info("Market Watch Agent started | symbol=%s", NIFTY50_NAME)
         self.bot.send(
             f"<b>{NIFTY50_NAME} Signal Bot is online!</b>\n\n"
             f"Live monitoring is ON.\n"
@@ -2063,29 +2487,35 @@ class MarketWatchAgent:
             try:
                 for msg in self.bot.get_messages():
                     print(f"Message: {msg}")
+                    LOG.info("Telegram command received | message=%s", msg)
                     try:
                         self._dispatch(msg)
                     except Exception as e:
                         err = f"⚠️ Error: {_escape(e)}"
                         print(err)
+                        LOG.exception("Command handling error | message=%s", msg)
                         self.bot.send(err)
 
                 try:
                     self._live_check()
                 except Exception as e:
                     print(f"Live check error: {e}")
+                    LOG.exception("Live check error")
 
                 time.sleep(self.cfg.tg_poll_interval)
 
             except KeyboardInterrupt:
                 self.bot.send(f"{NIFTY50_NAME} Signal Bot stopped.")
                 print("Stopped.")
+                LOG.info("Market Watch Agent stopped by keyboard interrupt")
                 return
             except requests.HTTPError as e:
                 print(f"HTTP error: {e}")
+                LOG.exception("HTTP error in main loop")
                 time.sleep(5)
             except Exception as e:
                 print(f"Error: {e}")
+                LOG.exception("Unexpected error in main loop")
                 time.sleep(5)
 
 
@@ -2096,6 +2526,8 @@ class MarketWatchAgent:
 
 def main() -> None:
     cfg = Config.from_env()
+    setup_logging(cfg)
+    LOG.info("Config loaded | quantity=%s lots=%s lot_size=%s product=%s", cfg.quantity, cfg.lots, cfg.lot_size, cfg.order_product_type)
     MarketWatchAgent(cfg).run()
 
 
