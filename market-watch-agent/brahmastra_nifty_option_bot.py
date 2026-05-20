@@ -1,5 +1,4 @@
 """NIFTY Brahmastra option-buying bot with live orders, alerts, and backtests.
-
 What this program does
 - Monitors NIFTY 50 on 5-minute candles.
 - Uses Supertrend 20,2 + MACD 12,26,9 + daily VWAP.
