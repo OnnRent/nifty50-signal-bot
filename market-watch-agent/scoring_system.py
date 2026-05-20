@@ -1,5 +1,4 @@
 """NIFTY50 signal bot with score-based BUY alerts and live auto orders.
-
 What this program does
 - NIFTY50 only
 - Live monitoring runs continuously in the background
