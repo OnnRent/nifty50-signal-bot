@@ -6,7 +6,7 @@ What this program does
 - Sends Telegram alerts when the full Brahmastra setup appears.
 - Selects ATM / slightly ITM NIFTY CE or PE using live premium filters.
 - Places live Dhan option BUY orders immediately after live signals.
-- Places and modifies broker-side SELL STOP_LOSS_MARKET orders for protection.
+- Places and modifies broker-side SELL STOP_LOSS orders for protection.
 - Books 50% at T1, moves SL to entry, trails the rest, and exits on T2,
   SL, opposite signal, or square-off.
 - Runs historical backtests with option entry/exit from historical option candles.
@@ -23,10 +23,11 @@ Important backtest rule
 
 Important live-order rule
 - Live mode places real Dhan orders. There is no paper-trading guard.
-- Entry orders are BUY MARKET by default.
-- Exit orders are SELL MARKET, while protection is maintained through a pending
-  SELL STOP_LOSS_MARKET order that the bot modifies as SL changes.
-- Dhan may convert API market orders to limit orders with MPP as per its rules.
+- Entry orders are BUY LIMIT by default with a small premium buffer.
+- Exit orders are SELL LIMIT by default, while protection is maintained through
+  a pending SELL STOP_LOSS order with trigger + limit price.
+- You can still switch to MARKET / STOP_LOSS_MARKET through env vars, but the
+  safer defaults avoid common exchange/Dhan rejections.
 
 Telegram commands
 - SCAN YYYY-MM-DD YYYY-MM-DD  Run historical backtest.
@@ -58,11 +59,19 @@ Useful optional variables
 - PREFERRED_PREMIUM_MAX=180
 - MAX_PREMIUM=250
 - LOT_SIZE=65
-- LOTS=2
-- ORDER_PRODUCT_TYPE=INTRADAY
-- ENTRY_ORDER_TYPE=MARKET
-- EXIT_ORDER_TYPE=MARKET
-- SL_ORDER_TYPE=STOP_LOSS_MARKET
+- DHAN_EXPIRY=2026-05-28
+- DHAN_POLL_SECONDS=5
+- DHAN_UNDERLYING_SECURITY_ID=13
+- DHAN_UNDERLYING_SEG=IDX_I
+- LOT_SIZE=65
+- LOTS=1
+- ORDER_PRODUCT_TYPE=MARGIN
+- ENTRY_ORDER_TYPE=LIMIT
+- EXIT_ORDER_TYPE=LIMIT
+- SL_ORDER_TYPE=STOP_LOSS
+- ENTRY_LIMIT_BUFFER=1.00
+- EXIT_LIMIT_BUFFER=1.00
+- STOP_LOSS_LIMIT_BUFFER=0.50
 - ORDER_VALIDITY=DAY
 
 Logging optional variables
@@ -105,13 +114,13 @@ TELEGRAM_BASE = "https://api.telegram.org"
 DHAN_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 DHAN_MASTER_DETAILED_URL = "https://images.dhan.co/api-data/api-scrip-master-detailed.csv"
 
-NIFTY50_SECURITY_ID = 13
-NIFTY50_SEGMENT = "IDX_I"
-NIFTY50_INSTRUMENT = "INDEX"
-NIFTY50_NAME = "NIFTY 50"
+NIFTY50_SECURITY_ID = int((os.getenv("UNDERLYING_SECURITY_ID") or os.getenv("DHAN_UNDERLYING_SECURITY_ID") or "13").strip())
+NIFTY50_SEGMENT = (os.getenv("UNDERLYING_SEGMENT") or os.getenv("DHAN_UNDERLYING_SEG") or "IDX_I").strip().upper()
+NIFTY50_INSTRUMENT = (os.getenv("UNDERLYING_INSTRUMENT") or "INDEX").strip().upper()
+NIFTY50_NAME = (os.getenv("INDEX_NAME") or "NIFTY 50").strip()
 
-FNO_SEGMENT = "NSE_FNO"
-OPTION_INSTRUMENT = "OPTIDX"
+FNO_SEGMENT = (os.getenv("FNO_SEGMENT") or "NSE_FNO").strip().upper()
+OPTION_INSTRUMENT = (os.getenv("OPTION_INSTRUMENT") or "OPTIDX").strip().upper()
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -242,6 +251,10 @@ class Config:
     order_validity: str = "DAY"
     order_status_poll_attempts: int = 15
     order_status_poll_seconds: float = 1.0
+    preferred_expiry: str = ""
+    entry_limit_buffer: float = 1.0
+    exit_limit_buffer: float = 1.0
+    stop_loss_limit_buffer: float = 0.50
 
     dhan_scrip_master_csv: Optional[str] = None
     download_dhan_master: bool = False
@@ -280,7 +293,7 @@ class Config:
             telegram_bot_token=required["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=required["TELEGRAM_CHAT_ID"],
             http_timeout=_env_int("HTTP_TIMEOUT", 20),
-            tg_poll_interval=_env_float("TG_POLL_INTERVAL", 5.0),
+            tg_poll_interval=_env_float("TG_POLL_INTERVAL", _env_float("DHAN_POLL_SECONDS", 5.0)),
             candle_interval=_env_int("CANDLE_INTERVAL", 5),
             supertrend_period=_env_int("SUPERTREND_PERIOD", 20),
             supertrend_multiplier=_env_float("SUPERTREND_MULTIPLIER", 2.0),
@@ -304,16 +317,20 @@ class Config:
             nifty_sl_buffer=_env_float("NIFTY_SL_BUFFER", 10.0),
             fallback_option_sl_pct=_env_float("FALLBACK_OPTION_SL_PCT", 0.20),
             lot_size=_env_int("LOT_SIZE", 65),
-            lots=_env_int("LOTS", 2),
+            lots=_env_int("LOTS", 1),
             brokerage_per_order=_env_float("BROKERAGE_PER_ORDER", 0.0),
             live_enabled_at_start=_env_bool("LIVE_ENABLED", True),
-            order_product_type=_env_str("ORDER_PRODUCT_TYPE", "INTRADAY").upper(),
-            entry_order_type=_env_str("ENTRY_ORDER_TYPE", "MARKET").upper(),
-            exit_order_type=_env_str("EXIT_ORDER_TYPE", "MARKET").upper(),
-            sl_order_type=_env_str("SL_ORDER_TYPE", "STOP_LOSS_MARKET").upper(),
+            order_product_type=_env_str("ORDER_PRODUCT_TYPE", "MARGIN").upper(),
+            entry_order_type=_env_str("ENTRY_ORDER_TYPE", "LIMIT").upper(),
+            exit_order_type=_env_str("EXIT_ORDER_TYPE", "LIMIT").upper(),
+            sl_order_type=_env_str("SL_ORDER_TYPE", "STOP_LOSS").upper(),
             order_validity=_env_str("ORDER_VALIDITY", "DAY").upper(),
             order_status_poll_attempts=_env_int("ORDER_STATUS_POLL_ATTEMPTS", 15),
             order_status_poll_seconds=_env_float("ORDER_STATUS_POLL_SECONDS", 1.0),
+            preferred_expiry=_env_str("PREFERRED_EXPIRY", _env_str("DHAN_EXPIRY", "")),
+            entry_limit_buffer=_env_float("ENTRY_LIMIT_BUFFER", 1.0),
+            exit_limit_buffer=_env_float("EXIT_LIMIT_BUFFER", 1.0),
+            stop_loss_limit_buffer=_env_float("STOP_LOSS_LIMIT_BUFFER", 0.50),
             dhan_scrip_master_csv=(os.getenv("DHAN_SCRIP_MASTER_CSV") or "").strip() or None,
             download_dhan_master=_env_bool("DOWNLOAD_DHAN_MASTER", False),
             dhan_scrip_master_url=_env_str("DHAN_SCRIP_MASTER_URL", DHAN_MASTER_URL),
@@ -612,6 +629,18 @@ class DhanApiClient:
             LOG.error("No expiry dates returned by Dhan")
             raise RuntimeError("No expiry dates returned by Dhan.")
 
+        preferred_expiry = self.cfg.preferred_expiry.strip()
+        if preferred_expiry:
+            for expiry in expiries:
+                if expiry.strip() == preferred_expiry:
+                    LOG.info("Picked preferred Dhan expiry from env | expiry=%s", expiry)
+                    return expiry
+            LOG.warning(
+                "Preferred expiry from env was not in Dhan expiry list | preferred=%s | available=%s",
+                preferred_expiry,
+                expiries[:5],
+            )
+
         parsed = []
         for expiry in expiries:
             expiry_date = parse_date_flexible(expiry)
@@ -810,12 +839,14 @@ class DhanApiClient:
             "boStopLossValue": 0.0,
         }
         LOG.warning(
-            "Placing LIVE Dhan order | txn=%s | security_id=%s | qty=%s | type=%s | product=%s | trigger=%s | correlation=%s",
+            "Placing LIVE Dhan order | txn=%s | segment=%s | security_id=%s | qty=%s | type=%s | product=%s | price=%s | trigger=%s | correlation=%s",
             payload["transactionType"],
+            payload["exchangeSegment"],
             security_id,
             quantity,
             payload["orderType"],
             payload["productType"],
+            payload["price"],
             trigger_price,
             payload["correlationId"],
         )
@@ -848,10 +879,11 @@ class DhanApiClient:
             "validity": (validity or self.cfg.order_validity).upper(),
         }
         LOG.warning(
-            "Modifying LIVE Dhan order | order_id=%s | qty=%s | type=%s | trigger=%s",
+            "Modifying LIVE Dhan order | order_id=%s | qty=%s | type=%s | price=%s | trigger=%s",
             order_id,
             quantity,
             order_type,
+            payload["price"],
             trigger_price,
         )
         r = self._request("PUT", f"/orders/{order_id}", payload=payload)
@@ -1128,6 +1160,10 @@ def num(v: Any, default: float = 0.0) -> float:
         return out
     except Exception:
         return default
+
+
+def price_tick(value: float) -> float:
+    return round(max(float(value), 0.05), 2)
 
 
 def fmt(v: Any, decimals: int = 2) -> str:
@@ -2519,6 +2555,7 @@ def format_order_update(
         qty = order.get("quantity") or req.get("quantity")
         filled = order.get("filledQty")
         avg = order.get("averageTradedPrice")
+        limit_price = order.get("price") or req.get("price")
         trigger = order.get("triggerPrice") or req.get("triggerPrice")
         if txn:
             lines.append(f"Txn         : {tg_escape(txn)}")
@@ -2528,6 +2565,8 @@ def format_order_update(
             lines.append(f"Filled Qty  : {tg_escape(filled)}")
         if avg is not None:
             lines.append(f"Avg Price   : Rs {fmt(avg)}")
+        if limit_price:
+            lines.append(f"Limit Price : Rs {fmt(limit_price)}")
         if trigger:
             lines.append(f"Trigger     : Rs {fmt(trigger)}")
         if order.get("omsErrorDescription"):
@@ -2815,19 +2854,33 @@ class BrahmastraBot:
         LOG.warning("Order polling ended without final state | order_id=%s | latest_status=%s", order_id_value, order_status(latest))
         return latest
 
-    def place_market_exit(self, position: LivePosition, quantity: int, reason: str) -> Optional[Dict[str, Any]]:
+    def place_market_exit(self, position: LivePosition, quantity: int, reason: str, ref_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
         if quantity <= 0:
             LOG.info("place_market_exit skipped: quantity <= 0 | reason=%s", reason)
             return None
-        LOG.warning("Placing market exit | qty=%s | reason=%s | option=%s %s", quantity, reason, position.plan.side, position.plan.strike)
+        exit_order_type = self.cfg.exit_order_type.upper()
+        exit_price = 0.0
+        if exit_order_type == "LIMIT":
+            base_price = ref_price or position.entry_avg_price or position.plan.option_entry
+            exit_price = price_tick(base_price - self.cfg.exit_limit_buffer)
+        LOG.warning(
+            "Placing exit | qty=%s | reason=%s | option=%s %s | type=%s | price=%s | ref_price=%s",
+            quantity,
+            reason,
+            position.plan.side,
+            position.plan.strike,
+            exit_order_type,
+            exit_price,
+            ref_price,
+        )
         order = self.api.place_order(
             transaction_type="SELL",
             security_id=position.plan.option_security_id,
             quantity=quantity,
-            order_type=self.cfg.exit_order_type,
+            order_type=exit_order_type,
             product_type=self.cfg.order_product_type,
             validity=self.cfg.order_validity,
-            price=0.0,
+            price=exit_price,
             trigger_price=0.0,
             correlation_id=make_correlation_id("EXIT"),
         )
@@ -2844,8 +2897,21 @@ class BrahmastraBot:
         return order
 
     def place_or_modify_stop_order(self, position: LivePosition, quantity: int, trigger_price: float, reason: str) -> None:
-        trigger_price = round(max(float(trigger_price), 0.05), 2)
-        LOG.warning("place_or_modify_stop_order | qty=%s | trigger=%s | reason=%s | existing_order=%s | existing_status=%s", quantity, trigger_price, reason, position.stop_order_id, position.stop_order_status)
+        trigger_price = price_tick(trigger_price)
+        sl_order_type = self.cfg.sl_order_type.upper()
+        sl_limit_price = 0.0
+        if sl_order_type == "STOP_LOSS":
+            sl_limit_price = price_tick(trigger_price - self.cfg.stop_loss_limit_buffer)
+        LOG.warning(
+            "place_or_modify_stop_order | qty=%s | type=%s | price=%s | trigger=%s | reason=%s | existing_order=%s | existing_status=%s",
+            quantity,
+            sl_order_type,
+            sl_limit_price,
+            trigger_price,
+            reason,
+            position.stop_order_id,
+            position.stop_order_status,
+        )
         if quantity <= 0:
             if position.stop_order_id and position.stop_order_status not in ORDER_DEAD_STATUSES | ORDER_FILLED_STATUSES:
                 cancelled = self.api.cancel_order(position.stop_order_id)
@@ -2854,30 +2920,78 @@ class BrahmastraBot:
             return
 
         if position.stop_order_id and position.stop_order_status not in ORDER_DEAD_STATUSES | ORDER_FILLED_STATUSES:
-            modified = self.api.modify_order(
-                position.stop_order_id,
-                quantity=quantity,
-                order_type=self.cfg.sl_order_type,
-                price=0.0,
-                trigger_price=trigger_price,
-                validity=self.cfg.order_validity,
-            )
+            try:
+                modified = self.api.modify_order(
+                    position.stop_order_id,
+                    quantity=quantity,
+                    order_type=sl_order_type,
+                    price=sl_limit_price,
+                    trigger_price=trigger_price,
+                    validity=self.cfg.order_validity,
+                )
+            except Exception as exc:
+                LOG.exception("SL order modify failed | order_id=%s | reason=%s", position.stop_order_id, reason)
+                failed = {
+                    "orderId": position.stop_order_id or "-",
+                    "orderStatus": "REJECTED",
+                    "omsErrorDescription": str(exc),
+                    "_request": {
+                        "transactionType": "SELL",
+                        "orderType": sl_order_type,
+                        "quantity": quantity,
+                        "price": sl_limit_price,
+                        "triggerPrice": trigger_price,
+                    },
+                }
+                self.bot.send(
+                    format_order_update(
+                        f"SL ORDER FAILED - {reason}",
+                        position,
+                        failed,
+                        "The position is still tracked, but the broker-side protective SL order was not updated.",
+                    )
+                )
+                return
             position.stop_order_status = order_status(modified)
             position.current_sl = trigger_price
             self.bot.send(format_order_update(f"SL ORDER MODIFIED - {reason}", position, modified))
             return
 
-        placed = self.api.place_order(
-            transaction_type="SELL",
-            security_id=position.plan.option_security_id,
-            quantity=quantity,
-            order_type=self.cfg.sl_order_type,
-            product_type=self.cfg.order_product_type,
-            validity=self.cfg.order_validity,
-            price=0.0,
-            trigger_price=trigger_price,
-            correlation_id=make_correlation_id("SL"),
-        )
+        try:
+            placed = self.api.place_order(
+                transaction_type="SELL",
+                security_id=position.plan.option_security_id,
+                quantity=quantity,
+                order_type=sl_order_type,
+                product_type=self.cfg.order_product_type,
+                validity=self.cfg.order_validity,
+                price=sl_limit_price,
+                trigger_price=trigger_price,
+                correlation_id=make_correlation_id("SL"),
+            )
+        except Exception as exc:
+            LOG.exception("SL order placement failed | reason=%s", reason)
+            failed = {
+                "orderId": "-",
+                "orderStatus": "REJECTED",
+                "omsErrorDescription": str(exc),
+                "_request": {
+                    "transactionType": "SELL",
+                    "orderType": sl_order_type,
+                    "quantity": quantity,
+                    "price": sl_limit_price,
+                    "triggerPrice": trigger_price,
+                },
+            }
+            self.bot.send(
+                format_order_update(
+                    f"SL ORDER FAILED - {reason}",
+                    position,
+                    failed,
+                    "The entry remains tracked, but Dhan did not accept the broker-side protective SL order.",
+                )
+            )
+            return
         position.stop_order_id = order_id(placed)
         position.stop_order_status = order_status(placed)
         position.current_sl = trigger_price
@@ -2978,17 +3092,45 @@ class BrahmastraBot:
             last_checked_option_ts=signal_ts,
         )
 
-        entry_order = self.api.place_order(
-            transaction_type="BUY",
-            security_id=signal.option_plan.option_security_id,
-            quantity=self.cfg.quantity,
-            order_type=self.cfg.entry_order_type,
-            product_type=self.cfg.order_product_type,
-            validity=self.cfg.order_validity,
-            price=0.0,
-            trigger_price=0.0,
-            correlation_id=make_correlation_id("ENTRY"),
-        )
+        entry_order_type = self.cfg.entry_order_type.upper()
+        entry_price = 0.0
+        if entry_order_type == "LIMIT":
+            entry_price = price_tick(signal.option_plan.option_entry + self.cfg.entry_limit_buffer)
+        try:
+            entry_order = self.api.place_order(
+                transaction_type="BUY",
+                security_id=signal.option_plan.option_security_id,
+                quantity=self.cfg.quantity,
+                order_type=entry_order_type,
+                product_type=self.cfg.order_product_type,
+                validity=self.cfg.order_validity,
+                price=entry_price,
+                trigger_price=0.0,
+                correlation_id=make_correlation_id("ENTRY"),
+            )
+        except Exception as exc:
+            LOG.exception("Entry order placement failed | trigger=%s", signal.trigger_key)
+            failed = {
+                "orderId": "-",
+                "orderStatus": "REJECTED",
+                "omsErrorDescription": str(exc),
+                "_request": {
+                    "transactionType": "BUY",
+                    "orderType": entry_order_type,
+                    "quantity": self.cfg.quantity,
+                    "price": entry_price,
+                    "triggerPrice": 0.0,
+                },
+            }
+            self.bot.send(
+                format_order_update(
+                    "ENTRY ORDER FAILED",
+                    position,
+                    failed,
+                    "Dhan rejected the entry order. No live position was opened by this bot.",
+                )
+            )
+            return
         position.entry_order_id = order_id(entry_order)
         position.entry_order_status = order_status(entry_order)
         self.bot.send(format_order_update("ENTRY ORDER PLACED", position, entry_order))
@@ -3093,7 +3235,7 @@ class BrahmastraBot:
                 LOG.warning("Live square-off condition met | time=%s | close=%s", row.timestamp, close)
                 self.cancel_stop_before_exit(position, "15:20 square-off")
                 if position.remaining_qty > 0:
-                    self.place_market_exit(position, position.remaining_qty, "15:20 square-off")
+                    self.place_market_exit(position, position.remaining_qty, "15:20 square-off", close)
                     self.bot.send(
                         format_live_position_update(
                             position,
@@ -3129,7 +3271,7 @@ class BrahmastraBot:
                 LOG.warning("Live T1 hit | time=%s | high=%s | t1=%s | booked_qty=%s | new_remaining=%s | new_sl=%s", row.timestamp, high, plan.option_target1, booked_qty, new_remaining, position.current_sl)
                 self.place_or_modify_stop_order(position, new_remaining, position.current_sl, "target 1 hit")
                 if booked_qty > 0:
-                    self.place_market_exit(position, booked_qty, "target 1")
+                    self.place_market_exit(position, booked_qty, "target 1", plan.option_target1)
                     position.remaining_qty = new_remaining
                 position.t1_hit = True
                 self.bot.send(
@@ -3150,7 +3292,7 @@ class BrahmastraBot:
                 LOG.warning("Live T2 hit | time=%s | high=%s | t2=%s", row.timestamp, high, plan.option_target2)
                 self.cancel_stop_before_exit(position, "target 2")
                 if position.remaining_qty > 0:
-                    self.place_market_exit(position, position.remaining_qty, "target 2")
+                    self.place_market_exit(position, position.remaining_qty, "target 2", plan.option_target2)
                     self.bot.send(
                         format_live_position_update(
                             position,
@@ -3188,7 +3330,7 @@ class BrahmastraBot:
                     self.cancel_stop_before_exit(position, "opposite Brahmastra signal")
                     if position.remaining_qty > 0:
                         action = "EXIT FULL" if not position.t1_hit else "EXIT REMAINING"
-                        self.place_market_exit(position, position.remaining_qty, "opposite signal")
+                        self.place_market_exit(position, position.remaining_qty, "opposite signal", close)
                         self.bot.send(
                             format_live_position_update(
                                 position,
