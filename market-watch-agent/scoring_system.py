@@ -22,10 +22,10 @@ Scoring idea
 
 Live order behavior
 - Live alert sends the same signal notification first.
-- Then the bot places a real BUY MARKET order for the suggested option.
-- After fill, it places a SELL STOP_LOSS_MARKET order.
+- Then the bot places a real BUY LIMIT order for the suggested option.
+- After fill, it places a SELL STOP_LOSS order with trigger + limit price.
 - At T1, it books 50%, moves SL to entry, and trails the rest.
-- At T2 or square-off, it cancels SL and sends a SELL MARKET exit.
+- At T2 or square-off, it cancels SL and sends a SELL LIMIT exit.
 - SCAN/backtest and manual strike snapshots do not place orders.
 
 Important note
@@ -71,11 +71,11 @@ load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 DHAN_BASE = "https://api.dhan.co/v2"
 TELEGRAM_BASE = "https://api.telegram.org"
 
-NIFTY50_SECURITY_ID = 13
-NIFTY50_SEGMENT = "IDX_I"
-NIFTY50_NAME = "NIFTY 50"
-FNO_SEGMENT = "NSE_FNO"
-OPTION_INSTRUMENT = "OPTIDX"
+NIFTY50_SECURITY_ID = int((os.getenv("UNDERLYING_SECURITY_ID") or os.getenv("DHAN_UNDERLYING_SECURITY_ID") or "13").strip())
+NIFTY50_SEGMENT = (os.getenv("UNDERLYING_SEGMENT") or os.getenv("DHAN_UNDERLYING_SEG") or "IDX_I").strip().upper()
+NIFTY50_NAME = (os.getenv("INDEX_NAME") or "NIFTY 50").strip()
+FNO_SEGMENT = (os.getenv("FNO_SEGMENT") or "NSE_FNO").strip().upper()
+OPTION_INSTRUMENT = (os.getenv("OPTION_INSTRUMENT") or "OPTIDX").strip().upper()
 IST = ZoneInfo("Asia/Kolkata")
 
 SCAN_RE = re.compile(r"^SCAN\s+(\d{4}-\d{2}-\d{2})\s+(\d{4}-\d{2}-\d{2})$", re.IGNORECASE)
@@ -84,9 +84,9 @@ LIVE_RE = re.compile(r"^LIVE$", re.IGNORECASE)
 STRIKE_RE = re.compile(r"^(CE|PE)\s*(\d{4,6})$", re.IGNORECASE)
 
 # Score threshold for BUY alerts.
-MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "7"))
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
 # Live polling interval in seconds. Keep >= 5 to stay comfortable with Dhan API rate limits.
-TG_POLL_INTERVAL_DEFAULT = float(os.getenv("TG_POLL_INTERVAL", "5"))
+TG_POLL_INTERVAL_DEFAULT = float(os.getenv("TG_POLL_INTERVAL") or os.getenv("DHAN_POLL_SECONDS") or "5")
 
 ORDER_FILLED_STATUSES = {"TRADED"}
 ORDER_DEAD_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED"}
@@ -111,17 +111,21 @@ class Config:
     tg_poll_interval: float = TG_POLL_INTERVAL_DEFAULT
     strikes_window: int = 5
 
-    # Optional live-order settings. Defaults preserve current configuration:
-    # no new env var is required to run the bot.
+    # Optional live-order settings.
     lot_size: int = 65
     lots: int = 2
-    order_product_type: str = "INTRADAY"
-    entry_order_type: str = "MARKET"
-    exit_order_type: str = "MARKET"
-    sl_order_type: str = "STOP_LOSS_MARKET"
+    live_enabled_at_start: bool = False
+    order_product_type: str = "MARGIN"
+    entry_order_type: str = "LIMIT"
+    exit_order_type: str = "LIMIT"
+    sl_order_type: str = "STOP_LOSS"
     order_validity: str = "DAY"
     order_status_poll_attempts: int = 15
     order_status_poll_seconds: float = 1.0
+    preferred_expiry: str = ""
+    entry_limit_buffer: float = 1.0
+    exit_limit_buffer: float = 1.0
+    stop_loss_limit_buffer: float = 0.50
     option_sl_buffer: float = 0.50
     square_off_time: dt.time = dt.time(15, 20)
     log_level: str = "INFO"
@@ -178,17 +182,22 @@ class Config:
             telegram_bot_token=required["TELEGRAM_BOT_TOKEN"],
             telegram_chat_id=required["TELEGRAM_CHAT_ID"],
             http_timeout=_int("HTTP_TIMEOUT", 15),
-            tg_poll_interval=_float("TG_POLL_INTERVAL", TG_POLL_INTERVAL_DEFAULT),
+            tg_poll_interval=_float("TG_POLL_INTERVAL", _float("DHAN_POLL_SECONDS", TG_POLL_INTERVAL_DEFAULT)),
             strikes_window=_int("STRIKES_WINDOW", 5),
             lot_size=_int("LOT_SIZE", 65),
             lots=_int("LOTS", 2),
-            order_product_type=_str("ORDER_PRODUCT_TYPE", "INTRADAY").upper(),
-            entry_order_type=_str("ENTRY_ORDER_TYPE", "MARKET").upper(),
-            exit_order_type=_str("EXIT_ORDER_TYPE", "MARKET").upper(),
-            sl_order_type=_str("SL_ORDER_TYPE", "STOP_LOSS_MARKET").upper(),
+            live_enabled_at_start=_bool("LIVE_ENABLED", False),
+            order_product_type=_str("ORDER_PRODUCT_TYPE", "MARGIN").upper(),
+            entry_order_type=_str("ENTRY_ORDER_TYPE", "LIMIT").upper(),
+            exit_order_type=_str("EXIT_ORDER_TYPE", "LIMIT").upper(),
+            sl_order_type=_str("SL_ORDER_TYPE", "STOP_LOSS").upper(),
             order_validity=_str("ORDER_VALIDITY", "DAY").upper(),
             order_status_poll_attempts=_int("ORDER_STATUS_POLL_ATTEMPTS", 15),
             order_status_poll_seconds=_float("ORDER_STATUS_POLL_SECONDS", 1.0),
+            preferred_expiry=_str("PREFERRED_EXPIRY", _str("DHAN_EXPIRY", "")),
+            entry_limit_buffer=_float("ENTRY_LIMIT_BUFFER", 1.0),
+            exit_limit_buffer=_float("EXIT_LIMIT_BUFFER", 1.0),
+            stop_loss_limit_buffer=_float("STOP_LOSS_LIMIT_BUFFER", 0.50),
             option_sl_buffer=_float("OPTION_SL_BUFFER", 0.50),
             log_level=_str("LOG_LEVEL", "INFO").upper(),
             log_dir=_str("LOG_DIR", "logs"),
@@ -428,7 +437,19 @@ class DhanApiClient:
         if not expiries:
             raise RuntimeError("No expiry dates returned by Dhan.")
 
-        today = dt.date.today()
+        preferred_expiry = self.cfg.preferred_expiry.strip()
+        if preferred_expiry:
+            for expiry in expiries:
+                if expiry.strip() == preferred_expiry:
+                    LOG.info("Picked preferred expiry from env | expiry=%s", expiry)
+                    return expiry
+            LOG.warning(
+                "Preferred expiry from env was not in Dhan expiry list | preferred=%s | available=%s",
+                preferred_expiry,
+                expiries[:5],
+            )
+
+        today = dt.datetime.now(IST).date()
 
         def parse_expiry(x: str) -> dt.date:
             for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%Y/%m/%d"):
@@ -576,11 +597,14 @@ class DhanApiClient:
             "boStopLossValue": 0.0,
         }
         LOG.info(
-            "Placing order | txn=%s security_id=%s qty=%s type=%s trigger=%s correlation=%s",
+            "Placing order | txn=%s segment=%s security_id=%s qty=%s type=%s product=%s price=%s trigger=%s correlation=%s",
             payload["transactionType"],
+            payload["exchangeSegment"],
             security_id,
             quantity,
             payload["orderType"],
+            payload["productType"],
+            payload["price"],
             payload["triggerPrice"],
             payload["correlationId"],
         )
@@ -624,10 +648,11 @@ class DhanApiClient:
             "validity": (validity or self.cfg.order_validity).upper(),
         }
         LOG.info(
-            "Modifying order | order_id=%s qty=%s type=%s trigger=%s",
+            "Modifying order | order_id=%s qty=%s type=%s price=%s trigger=%s",
             order_id,
             quantity,
             payload["orderType"],
+            payload["price"],
             payload["triggerPrice"],
         )
         if self.cfg.log_http_payloads:
@@ -799,6 +824,10 @@ def _num(v: Any, default: float = 0.0) -> float:
         return out
     except Exception:
         return default
+
+
+def _price_tick(value: float) -> float:
+    return round(max(float(value), 0.05), 2)
 
 
 def _fmt(v: Any, decimals: int = 2) -> str:
@@ -1448,6 +1477,7 @@ def format_order_update(title: str, position: Optional[LivePosition], order: Opt
         qty = order.get("quantity") or req.get("quantity")
         filled = order.get("filledQty")
         avg = order.get("averageTradedPrice")
+        limit_price = order.get("price") or req.get("price")
         trigger = order.get("triggerPrice") or req.get("triggerPrice")
         if txn:
             lines.append(f"Txn         : {_escape(txn)}")
@@ -1457,6 +1487,8 @@ def format_order_update(title: str, position: Optional[LivePosition], order: Opt
             lines.append(f"Filled Qty  : {_escape(filled)}")
         if avg is not None:
             lines.append(f"Avg Price   : ₹{_fmt(avg)}")
+        if limit_price:
+            lines.append(f"Limit Price : ₹{_fmt(limit_price)}")
         if trigger:
             lines.append(f"Trigger     : ₹{_fmt(trigger)}")
         if order.get("omsErrorDescription"):
@@ -1608,7 +1640,7 @@ class MarketWatchAgent:
         self.bot = TelegramBot(cfg.telegram_bot_token, cfg.telegram_chat_id, cfg.http_timeout)
         self.expiry: Optional[str] = None
 
-        self.live_enabled = True
+        self.live_enabled = cfg.live_enabled_at_start
         self.last_live_key: Optional[str] = None
         self.last_live_candle_time: Optional[str] = None
         self.live_positions: List[LivePosition] = []
@@ -1711,25 +1743,33 @@ class MarketWatchAgent:
         LOG.warning("Order polling ended before terminal status | order_id=%s status=%s", order_id_value, _order_status(latest))
         return latest
 
-    def _place_market_exit(self, position: LivePosition, quantity: int, reason: str) -> Optional[Dict[str, Any]]:
+    def _place_market_exit(self, position: LivePosition, quantity: int, reason: str, ref_price: Optional[float] = None) -> Optional[Dict[str, Any]]:
         if quantity <= 0:
             LOG.info("Market exit skipped | reason=%s quantity=%s", reason, quantity)
             return None
+        exit_order_type = self.cfg.exit_order_type.upper()
+        exit_price = 0.0
+        if exit_order_type == "LIMIT":
+            base_price = ref_price or position.entry_avg_price or position.plan.entry
+            exit_price = _price_tick(base_price - self.cfg.exit_limit_buffer)
         LOG.info(
-            "Placing market exit | reason=%s security_id=%s quantity=%s remaining_before=%s",
+            "Placing exit | reason=%s security_id=%s quantity=%s remaining_before=%s type=%s price=%s ref_price=%s",
             reason,
             position.plan.option_security_id,
             quantity,
             position.remaining_qty,
+            exit_order_type,
+            exit_price,
+            ref_price,
         )
         order = self.api.place_order(
             transaction_type="SELL",
             security_id=int(position.plan.option_security_id or 0),
             quantity=quantity,
-            order_type=self.cfg.exit_order_type,
+            order_type=exit_order_type,
             product_type=self.cfg.order_product_type,
             validity=self.cfg.order_validity,
-            price=0.0,
+            price=exit_price,
             trigger_price=0.0,
             correlation_id=_make_correlation_id("EXIT"),
         )
@@ -1752,7 +1792,11 @@ class MarketWatchAgent:
         return order
 
     def _place_or_modify_stop_order(self, position: LivePosition, quantity: int, trigger_price: float, reason: str) -> None:
-        trigger_price = round(max(float(trigger_price), 0.05), 2)
+        trigger_price = _price_tick(trigger_price)
+        sl_order_type = self.cfg.sl_order_type.upper()
+        sl_limit_price = 0.0
+        if sl_order_type == "STOP_LOSS":
+            sl_limit_price = _price_tick(trigger_price - self.cfg.stop_loss_limit_buffer)
         if quantity <= 0:
             LOG.info(
                 "Stop order not needed | reason=%s quantity=%s existing_stop=%s",
@@ -1775,14 +1819,38 @@ class MarketWatchAgent:
                 quantity,
                 trigger_price,
             )
-            modified = self.api.modify_order(
-                position.stop_order_id,
-                quantity=quantity,
-                order_type=self.cfg.sl_order_type,
-                price=0.0,
-                trigger_price=trigger_price,
-                validity=self.cfg.order_validity,
-            )
+            try:
+                modified = self.api.modify_order(
+                    position.stop_order_id,
+                    quantity=quantity,
+                    order_type=sl_order_type,
+                    price=sl_limit_price,
+                    trigger_price=trigger_price,
+                    validity=self.cfg.order_validity,
+                )
+            except Exception as exc:
+                LOG.exception("Stop order modify failed | stop_order_id=%s reason=%s", position.stop_order_id, reason)
+                failed = {
+                    "orderId": position.stop_order_id or "-",
+                    "orderStatus": "REJECTED",
+                    "omsErrorDescription": str(exc),
+                    "_request": {
+                        "transactionType": "SELL",
+                        "orderType": sl_order_type,
+                        "quantity": quantity,
+                        "price": sl_limit_price,
+                        "triggerPrice": trigger_price,
+                    },
+                }
+                self.bot.send(
+                    format_order_update(
+                        f"SL ORDER FAILED - {reason}",
+                        position,
+                        failed,
+                        "The position is still tracked, but the broker-side protective SL order was not updated.",
+                    )
+                )
+                return
             position.stop_order_status = _order_status(modified)
             position.current_sl = trigger_price
             self.bot.send(format_order_update(f"SL ORDER MODIFIED - {reason}", position, modified))
@@ -1796,17 +1864,41 @@ class MarketWatchAgent:
             quantity,
             trigger_price,
         )
-        placed = self.api.place_order(
-            transaction_type="SELL",
-            security_id=int(position.plan.option_security_id or 0),
-            quantity=quantity,
-            order_type=self.cfg.sl_order_type,
-            product_type=self.cfg.order_product_type,
-            validity=self.cfg.order_validity,
-            price=0.0,
-            trigger_price=trigger_price,
-            correlation_id=_make_correlation_id("SL"),
-        )
+        try:
+            placed = self.api.place_order(
+                transaction_type="SELL",
+                security_id=int(position.plan.option_security_id or 0),
+                quantity=quantity,
+                order_type=sl_order_type,
+                product_type=self.cfg.order_product_type,
+                validity=self.cfg.order_validity,
+                price=sl_limit_price,
+                trigger_price=trigger_price,
+                correlation_id=_make_correlation_id("SL"),
+            )
+        except Exception as exc:
+            LOG.exception("Stop order placement failed | reason=%s", reason)
+            failed = {
+                "orderId": "-",
+                "orderStatus": "REJECTED",
+                "omsErrorDescription": str(exc),
+                "_request": {
+                    "transactionType": "SELL",
+                    "orderType": sl_order_type,
+                    "quantity": quantity,
+                    "price": sl_limit_price,
+                    "triggerPrice": trigger_price,
+                },
+            }
+            self.bot.send(
+                format_order_update(
+                    f"SL ORDER FAILED - {reason}",
+                    position,
+                    failed,
+                    "The entry remains tracked, but Dhan did not accept the broker-side protective SL order.",
+                )
+            )
+            return
         position.stop_order_id = _order_id(placed)
         position.stop_order_status = _order_status(placed)
         position.current_sl = trigger_price
@@ -1933,17 +2025,45 @@ class MarketWatchAgent:
             self.cfg.quantity,
         )
 
-        entry_order = self.api.place_order(
-            transaction_type="BUY",
-            security_id=int(plan.option_security_id),
-            quantity=self.cfg.quantity,
-            order_type=self.cfg.entry_order_type,
-            product_type=self.cfg.order_product_type,
-            validity=self.cfg.order_validity,
-            price=0.0,
-            trigger_price=0.0,
-            correlation_id=_make_correlation_id("ENTRY"),
-        )
+        entry_order_type = self.cfg.entry_order_type.upper()
+        entry_price = 0.0
+        if entry_order_type == "LIMIT":
+            entry_price = _price_tick(plan.entry + self.cfg.entry_limit_buffer)
+        try:
+            entry_order = self.api.place_order(
+                transaction_type="BUY",
+                security_id=int(plan.option_security_id),
+                quantity=self.cfg.quantity,
+                order_type=entry_order_type,
+                product_type=self.cfg.order_product_type,
+                validity=self.cfg.order_validity,
+                price=entry_price,
+                trigger_price=0.0,
+                correlation_id=_make_correlation_id("ENTRY"),
+            )
+        except Exception as exc:
+            LOG.exception("Entry order placement failed | candle=%s", signal.candle_time)
+            failed = {
+                "orderId": "-",
+                "orderStatus": "REJECTED",
+                "omsErrorDescription": str(exc),
+                "_request": {
+                    "transactionType": "BUY",
+                    "orderType": entry_order_type,
+                    "quantity": self.cfg.quantity,
+                    "price": entry_price,
+                    "triggerPrice": 0.0,
+                },
+            }
+            self.bot.send(
+                format_order_update(
+                    "ENTRY ORDER FAILED",
+                    position,
+                    failed,
+                    "Dhan rejected the entry order. No live position was opened by this bot.",
+                )
+            )
+            return
         position.entry_order_id = _order_id(entry_order)
         position.entry_order_status = _order_status(entry_order)
         self.bot.send(format_order_update("ENTRY ORDER PLACED", position, entry_order))
@@ -2050,7 +2170,7 @@ class MarketWatchAgent:
                 LOG.info("Square-off time reached | row_time=%s remaining=%s", row.timestamp, position.remaining_qty)
                 self._cancel_stop_before_exit(position, "15:20 square-off")
                 if position.remaining_qty > 0:
-                    self._place_market_exit(position, position.remaining_qty, "15:20 square-off")
+                    self._place_market_exit(position, position.remaining_qty, "15:20 square-off", close)
                     self.bot.send(
                         format_live_position_update(
                             position,
@@ -2086,7 +2206,7 @@ class MarketWatchAgent:
                 try:
                     self._place_or_modify_stop_order(position, new_remaining, new_sl, "target 1 hit")
                     if booked_qty > 0:
-                        self._place_market_exit(position, booked_qty, "target 1")
+                        self._place_market_exit(position, booked_qty, "target 1", plan.target1)
                         position.remaining_qty = new_remaining
                 except Exception:
                     LOG.exception("Target 1 handling failed; attempting restore")
@@ -2115,7 +2235,7 @@ class MarketWatchAgent:
                 LOG.info("Target 2 hit | time=%s high=%s target2=%s remaining=%s", row.timestamp, high, plan.target2, position.remaining_qty)
                 self._cancel_stop_before_exit(position, "target 2")
                 if position.remaining_qty > 0:
-                    self._place_market_exit(position, position.remaining_qty, "target 2")
+                    self._place_market_exit(position, position.remaining_qty, "target 2", plan.target2)
                     self.bot.send(
                         format_live_position_update(
                             position,
@@ -2161,7 +2281,7 @@ class MarketWatchAgent:
                     self._cancel_stop_before_exit(position, "opposite scored signal")
                     if position.remaining_qty > 0:
                         action = "EXIT FULL" if not position.t1_hit else "EXIT REMAINING"
-                        self._place_market_exit(position, position.remaining_qty, "opposite scored signal")
+                        self._place_market_exit(position, position.remaining_qty, "opposite scored signal", close)
                         self.bot.send(
                             format_live_position_update(
                                 position,
@@ -2476,9 +2596,10 @@ class MarketWatchAgent:
         LOG.info("Market Watch Agent started | symbol=%s", NIFTY50_NAME)
         self.bot.send(
             f"<b>{NIFTY50_NAME} Signal Bot is online!</b>\n\n"
-            f"Live monitoring is ON.\n"
+            f"Live monitoring: {'ON' if self.live_enabled else 'OFF'}.\n"
             f"Live orders: REAL DHAN ORDERS.\n"
             f"Send <code>SCAN YYYY-MM-DD YYYY-MM-DD</code> for backtest.\n"
+            f"Send <code>LIVE</code> to enable real live orders.\n"
             f"Send <code>STOP</code> to stop a scan.\n"
             f"Alerts fire only when score >= {MIN_SIGNAL_SCORE}."
         )
