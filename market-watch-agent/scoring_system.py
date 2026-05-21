@@ -84,7 +84,7 @@ LIVE_RE = re.compile(r"^LIVE$", re.IGNORECASE)
 STRIKE_RE = re.compile(r"^(CE|PE)\s*(\d{4,6})$", re.IGNORECASE)
 
 # Score threshold for BUY alerts.
-MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "8"))
+MIN_SIGNAL_SCORE = int(os.getenv("MIN_SIGNAL_SCORE", "7"))
 # Live polling interval in seconds. Keep >= 5 to stay comfortable with Dhan API rate limits.
 TG_POLL_INTERVAL_DEFAULT = float(os.getenv("TG_POLL_INTERVAL", "5"))
 
