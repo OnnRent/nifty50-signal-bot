@@ -100,7 +100,7 @@ class Config:
     tg_poll_interval: float = 5.0
     live_check_interval: float = 30.0
 
-    min_signal_score: int = 8
+    min_signal_score: int = 10
     strikes_window: int = 5
     option_candidates_to_check: int = 5
     min_expiry_hours: float = 6.0
@@ -154,7 +154,7 @@ class Config:
             http_timeout=_int("HTTP_TIMEOUT", 15),
             tg_poll_interval=_float("TG_POLL_INTERVAL", 5.0),
             live_check_interval=_float("LIVE_CHECK_INTERVAL", 30.0),
-            min_signal_score=_int("MIN_SIGNAL_SCORE", 8),
+            min_signal_score=_int("MIN_SIGNAL_SCORE", 10),
             strikes_window=_int("STRIKES_WINDOW", 5),
             option_candidates_to_check=_int("OPTION_CANDIDATES_TO_CHECK", 5),
             min_expiry_hours=_float("MIN_EXPIRY_HOURS", 6.0),
