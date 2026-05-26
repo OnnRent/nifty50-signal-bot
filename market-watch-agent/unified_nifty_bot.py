@@ -59,6 +59,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+import functools
 
 import numpy as np
 import pandas as pd
@@ -73,6 +74,44 @@ TELEGRAM_BASE = "https://api.telegram.org"
 IST = ZoneInfo("Asia/Kolkata")
 
 LOG = logging.getLogger("unified_nifty_bot")
+def setup_bootstrap_logging() -> None:
+    """Early logging before .env/config validation succeeds."""
+    if LOG.handlers:
+        return
+
+    LOG.setLevel(logging.DEBUG)
+    LOG.propagate = False
+
+    formatter = logging.Formatter(
+        "%(asctime)s.%(msecs)03d %(levelname)-8s [%(threadName)s] %(name)s:%(lineno)d - %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    log_dir = Path(__file__).resolve().parent / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    file_handler = RotatingFileHandler(
+        log_dir / "unified_nifty_bot.bootstrap.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    file_handler.setLevel(logging.DEBUG)
+    LOG.addHandler(file_handler)
+
+    console = logging.StreamHandler()
+    console.setFormatter(formatter)
+    console.setLevel(logging.INFO)
+    LOG.addHandler(console)
+
+    LOG.info(
+        "Bootstrap logging initialized | file=%s | cwd=%s | pid=%s | python=%s",
+        log_dir / "unified_nifty_bot.bootstrap.log",
+        os.getcwd(),
+        os.getpid(),
+        sys.version.split()[0],
+    )
 SENSITIVE_KEY_RE = re.compile(
     r"(token|access|authorization|password|secret|chat[_-]?id|client[_-]?id|clientid|dhanclientid)",
     re.IGNORECASE,
@@ -445,6 +484,19 @@ def setup_logging(cfg: Config) -> None:
         log_dir / cfg.log_file,
         cfg.enabled_strategies,
     )
+    config_snapshot = dataclasses.asdict(cfg)
+    for key in list(config_snapshot.keys()):
+        if SENSITIVE_KEY_RE.search(str(key)):
+            config_snapshot[key] = "<set>" if config_snapshot[key] else "<missing>"
+
+    LOG.info(
+        "Runtime context | file=%s | cwd=%s | pid=%s | python=%s",
+        Path(__file__).resolve(),
+        os.getcwd(),
+        os.getpid(),
+        sys.version.split()[0],
+    )
+    LOG.info("Config summary | %s", json.dumps(config_snapshot, ensure_ascii=True, default=str))
 
 
 # -----------------------------------------------------------------------------
@@ -3841,22 +3893,44 @@ class UnifiedNiftyBot:
                 LOG.exception("Command failed | message=%s", message)
                 self.telegram.send(f"<b>Command error</b>\n{tg_escape(exc)}")
 
-    def live_tick(self) -> None:
+      def live_tick(self) -> None:
         if not self.live_enabled:
+            self.live_scan_log("Live scan skipped | live disabled", force=True)
             return
         if not market_session_open():
             self.live_scan_log("Live scan skipped | market closed | now=%s", now_ist())
             return
+
+        self.live_scan_log(
+            "Live tick started | positions=%s | pending_buy=%s | strategies=%s",
+            len(self.order_manager.positions),
+            bool(self.order_manager.pending_entry_order_id),
+            ",".join(self.strategies.keys()),
+        )
+
         self.order_manager.sync_pending_buy()
         index_df = self.cache.current_closed_index()
         if index_df.empty:
             self.live_scan_log("Live scan skipped | no closed candles", force=True)
             return
+
+        latest = index_df.iloc[-1]
+        self.live_scan_log(
+            "Live candles ready | rows=%s | latest_ts=%s | close=%s | high=%s | low=%s",
+            len(index_df),
+            latest.timestamp,
+            fmt(latest.close),
+            fmt(latest.high),
+            fmt(latest.low),
+        )
+
         self.order_manager.manage_positions(index_df.reset_index(drop=True), self.strategies)
         for name, strategy in self.strategies.items():
             if not strategy.live_enabled:
+                LOG.debug("Live strategy skipped | strategy=%s | reason=strategy paused", name)
                 continue
             try:
+                LOG.debug("Live strategy check started | strategy=%s | candles=%s", name, len(index_df))
                 signal = strategy.live_check(index_df.reset_index(drop=True))
             except Exception as exc:
                 LOG.exception("Strategy live check failed | strategy=%s", name)
@@ -3865,6 +3939,32 @@ class UnifiedNiftyBot:
             if signal is not None:
                 LOG.warning("Live signal accepted | strategy=%s | trigger=%s", name, signal.trigger_key)
                 self.order_manager.handle_signal(signal)
+            else:
+                LOG.debug("Live strategy no signal | strategy=%s | latest_candle=%s", name, latest.timestamp)
+    # def live_tick(self) -> None:
+    #     if not self.live_enabled:
+    #         return
+    #     if not market_session_open():
+    #         self.live_scan_log("Live scan skipped | market closed | now=%s", now_ist())
+    #         return
+    #     self.order_manager.sync_pending_buy()
+    #     index_df = self.cache.current_closed_index()
+    #     if index_df.empty:
+    #         self.live_scan_log("Live scan skipped | no closed candles", force=True)
+    #         return
+    #     self.order_manager.manage_positions(index_df.reset_index(drop=True), self.strategies)
+    #     for name, strategy in self.strategies.items():
+    #         if not strategy.live_enabled:
+    #             continue
+    #         try:
+    #             signal = strategy.live_check(index_df.reset_index(drop=True))
+    #         except Exception as exc:
+    #             LOG.exception("Strategy live check failed | strategy=%s", name)
+    #             self.telegram.send(f"<b>{tg_escape(name)} live check error</b>\n{tg_escape(exc)}")
+    #             continue
+    #         if signal is not None:
+    #             LOG.warning("Live signal accepted | strategy=%s | trigger=%s", name, signal.trigger_key)
+    #             self.order_manager.handle_signal(signal)
 
     def run(self) -> None:
         print(f"Unified NIFTY bot started | {self.cfg.index_name}")
@@ -3892,35 +3992,260 @@ class UnifiedNiftyBot:
                     LOG.exception("Could not send main loop error to Telegram")
                 time.sleep(5)
 
+_RUNTIME_LOGGING_INSTALLED = False
+
+
+def _summarize_for_log(value: Any, max_len: int = 260) -> str:
+    try:
+        if value is None:
+            return "None"
+        if isinstance(value, pd.DataFrame):
+            if value.empty:
+                return "DataFrame(rows=0)"
+            cols = ",".join(str(col) for col in value.columns[:8])
+            first_ts = value["timestamp"].iloc[0] if "timestamp" in value.columns else "-"
+            last_ts = value["timestamp"].iloc[-1] if "timestamp" in value.columns else "-"
+            return f"DataFrame(rows={len(value)}, cols=[{cols}], first_ts={first_ts}, last_ts={last_ts})"
+        if isinstance(value, BacktestResult):
+            return (
+                f"BacktestResult(strategy={value.strategy}, trades={len(value.trades)}, "
+                f"pnl={value.total_pnl:.2f}, errors={len(value.errors)})"
+            )
+        if isinstance(value, UnifiedSignal):
+            plan = value.option_plan
+            return (
+                f"UnifiedSignal(strategy={value.strategy}, side={value.side}, spot={value.spot}, "
+                f"trigger={value.trigger_key}, option={plan.side} {plan.strike:.0f}, "
+                f"entry={plan.entry}, sl={plan.stop_loss}, qty={plan.quantity})"
+            )
+        if isinstance(value, OptionTradePlan):
+            return (
+                f"OptionTradePlan(strategy={value.strategy}, option={value.side} {value.strike:.0f}, "
+                f"security_id={value.security_id}, entry={value.entry}, sl={value.stop_loss}, "
+                f"t1={value.target1}, t2={value.target2}, qty={value.quantity})"
+            )
+        if isinstance(value, dict):
+            compact = {
+                key: value.get(key)
+                for key in (
+                    "orderId",
+                    "order_id",
+                    "orderStatus",
+                    "status",
+                    "transactionType",
+                    "quantity",
+                    "filledQty",
+                    "remainingQuantity",
+                    "averageTradedPrice",
+                )
+                if key in value
+            }
+            if compact:
+                return f"dict({redact_for_log(compact)})"
+            return f"dict(keys={list(value.keys())[:12]})"
+        if isinstance(value, (list, tuple, set)):
+            return f"{type(value).__name__}(len={len(value)}, sample={list(value)[:3]})"
+        text = str(value).replace("\n", " | ")
+        text = re.sub(r"(<code>).*?(</code>)", r"\1...redacted...\2", text)
+        return text if len(text) <= max_len else text[:max_len] + "...<truncated>"
+    except Exception as exc:
+        return f"<summary failed: {exc}>"
+
+
+def _summarize_call(args: Tuple[Any, ...], kwargs: Dict[str, Any]) -> str:
+    parts: List[str] = []
+    for arg in args[:5]:
+        parts.append(_summarize_for_log(arg, max_len=120))
+    if len(args) > 5:
+        parts.append(f"...+{len(args) - 5} args")
+    for key, value in list(kwargs.items())[:8]:
+        if SENSITIVE_KEY_RE.search(str(key)):
+            parts.append(f"{key}=<redacted>")
+        else:
+            parts.append(f"{key}={_summarize_for_log(value, max_len=120)}")
+    if len(kwargs) > 8:
+        parts.append(f"...+{len(kwargs) - 8} kwargs")
+    return ", ".join(parts)
+
+
+def _wrap_logged_method(cls: Any, method_name: str, level: int = logging.DEBUG) -> bool:
+    original = getattr(cls, method_name, None)
+    if original is None or getattr(original, "_runtime_logged", False):
+        return False
+
+    @functools.wraps(original)
+    def wrapper(self: Any, *args: Any, **kwargs: Any) -> Any:
+        started = time.perf_counter()
+        call_name = f"{cls.__name__}.{method_name}"
+        LOG.log(level, "START | %s | %s", call_name, _summarize_call(args, kwargs))
+        try:
+            result = original(self, *args, **kwargs)
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            LOG.log(level, "OK | %s | elapsed_ms=%.0f | result=%s", call_name, elapsed_ms, _summarize_for_log(result))
+            return result
+        except SystemExit as exc:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            LOG.error("EXIT | %s | elapsed_ms=%.0f | reason=%s", call_name, elapsed_ms, exc)
+            raise
+        except Exception:
+            elapsed_ms = (time.perf_counter() - started) * 1000.0
+            LOG.exception("FAIL | %s | elapsed_ms=%.0f", call_name, elapsed_ms)
+            raise
+
+    wrapper._runtime_logged = True  # type: ignore[attr-defined]
+    setattr(cls, method_name, wrapper)
+    return True
+
+
+def install_runtime_logging() -> None:
+    """Install additive method-level logging wrappers after all classes are defined."""
+    global _RUNTIME_LOGGING_INSTALLED
+    if _RUNTIME_LOGGING_INSTALLED:
+        return
+
+    wrapped = 0
+    for method in (
+        "intraday_candles",
+        "index_intraday",
+        "option_intraday",
+        "rolling_option_intraday",
+        "expiry_list",
+        "pick_expiry",
+        "option_chain",
+        "place_order",
+        "modify_order",
+        "cancel_order",
+        "get_order",
+    ):
+        wrapped += int(_wrap_logged_method(DhanApiClient, method, logging.DEBUG))
+
+    for method in ("send", "get_messages"):
+        wrapped += int(_wrap_logged_method(TelegramBot, method, logging.DEBUG))
+
+    for method in ("ensure_expiry", "current_index", "current_closed_index", "option_chain", "clear"):
+        wrapped += int(_wrap_logged_method(MarketDataCache, method, logging.DEBUG))
+
+    for method in (
+        "handle_signal",
+        "execute_buy_order",
+        "wait_order",
+        "place_stop_order",
+        "modify_stop",
+        "sync_stop_order",
+        "sync_entry_order",
+        "manage_positions",
+        "manage_position",
+        "edit_draft",
+        "buy_draft",
+        "modify_pending_buy",
+        "cancel_pending_buy",
+        "activate_filled_pending_buy",
+        "sync_pending_buy",
+        "pending_buy_status",
+    ):
+        wrapped += int(_wrap_logged_method(OrderManager, method, logging.DEBUG))
+
+    for cls in (ScoreStrategy, BrahmastraStrategy, RsiBbStrategy):
+        for method in ("live_check", "run_backtest", "build_signal", "opposite_exit"):
+            wrapped += int(_wrap_logged_method(cls, method, logging.DEBUG))
+
+    for method in (
+        "__init__",
+        "set_all_live",
+        "strategy_live",
+        "chain_message",
+        "status_message",
+        "strike_snapshot",
+        "start_scan",
+        "scan_worker",
+        "save_backtest_outputs",
+        "dispatch",
+        "process_telegram_messages",
+        "live_tick",
+        "run",
+    ):
+        wrapped += int(_wrap_logged_method(UnifiedNiftyBot, method, logging.DEBUG))
+
+    _RUNTIME_LOGGING_INSTALLED = True
+    LOG.info("Runtime method logging installed | wrapped_methods=%s", wrapped)
 
 # -----------------------------------------------------------------------------
 # CLI
 # -----------------------------------------------------------------------------
 
-
 def cmd_live(_: argparse.Namespace) -> None:
-    cfg = Config.from_env(require_credentials=True)
+    setup_bootstrap_logging()
+    LOG.info("Live command starting")
+    try:
+        cfg = Config.from_env(require_credentials=True)
+    except SystemExit as exc:
+        LOG.error("Configuration failed before runtime logging setup | %s", exc)
+        raise
     setup_logging(cfg)
+    install_runtime_logging()
+    LOG.info("Live command configured | strategies=%s | live=%s | real_orders=%s | auto_buy=%s",
+             cfg.enabled_strategies, cfg.live_enabled_at_start, cfg.live_trading_enabled, cfg.auto_buy_enabled)
     UnifiedNiftyBot(cfg).run()
 
 
 def cmd_backtest(args: argparse.Namespace) -> None:
-    cfg = Config.from_env(require_credentials=True)
+    setup_bootstrap_logging()
+    LOG.info("Backtest command starting | start=%s | end=%s | strategy=%s", args.start, args.end, args.strategy)
+    try:
+        cfg = Config.from_env(require_credentials=True)
+    except SystemExit as exc:
+        LOG.error("Configuration failed before runtime logging setup | %s", exc)
+        raise
     setup_logging(cfg)
+    install_runtime_logging()
     bot = UnifiedNiftyBot(cfg)
     name = bot.normalize_strategy_name(args.strategy) if args.strategy else None
     if name:
         names = [name]
     else:
         names = list(bot.strategies.keys())
+    LOG.info("Backtest strategy list resolved | names=%s", names)
     for strategy_name in names:
         strategy = bot.strategies.get(strategy_name)
         if strategy is None:
+            LOG.warning("Backtest skipped | strategy not enabled | strategy=%s", strategy_name)
             print(f"Strategy not enabled: {strategy_name}")
             continue
+        LOG.info("Backtest running | strategy=%s | start=%s | end=%s", strategy_name, args.start, args.end)
         result = strategy.run_backtest(args.start, args.end, threading.Event())
+        LOG.info(
+            "Backtest completed | strategy=%s | trades=%s | pnl=%.2f | errors=%s",
+            strategy_name,
+            len(result.trades),
+            result.total_pnl,
+            len(result.errors),
+        )
         print(format_backtest_summary(result))
         bot.save_backtest_outputs(result)
+
+# def cmd_live(_: argparse.Namespace) -> None:
+#     cfg = Config.from_env(require_credentials=True)
+#     setup_logging(cfg)
+#     UnifiedNiftyBot(cfg).run()
+
+
+# def cmd_backtest(args: argparse.Namespace) -> None:
+#     cfg = Config.from_env(require_credentials=True)
+#     setup_logging(cfg)
+#     bot = UnifiedNiftyBot(cfg)
+#     name = bot.normalize_strategy_name(args.strategy) if args.strategy else None
+#     if name:
+#         names = [name]
+#     else:
+#         names = list(bot.strategies.keys())
+#     for strategy_name in names:
+#         strategy = bot.strategies.get(strategy_name)
+#         if strategy is None:
+#             print(f"Strategy not enabled: {strategy_name}")
+#             continue
+#         result = strategy.run_backtest(args.start, args.end, threading.Event())
+#         print(format_backtest_summary(result))
+#         bot.save_backtest_outputs(result)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3939,14 +4264,29 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# def main(argv: Optional[List[str]] = None) -> None:
+#     if argv is None:
+#         argv = sys.argv[1:]
+#     if not argv:
+#         argv = ["live"]
+#     parser = build_parser()
+#     args = parser.parse_args(argv)
+#     if not hasattr(args, "func"):
+#         parser.print_help()
+#         return
+#     args.func(args)
 def main(argv: Optional[List[str]] = None) -> None:
+    setup_bootstrap_logging()
     if argv is None:
         argv = sys.argv[1:]
+    LOG.info("CLI main entered | argv=%s", argv)
     if not argv:
         argv = ["live"]
+        LOG.info("No CLI command supplied; defaulting to live")
     parser = build_parser()
     args = parser.parse_args(argv)
     if not hasattr(args, "func"):
+        LOG.warning("No command handler resolved; printing help")
         parser.print_help()
         return
     args.func(args)
