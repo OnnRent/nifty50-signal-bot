@@ -3893,54 +3893,54 @@ class UnifiedNiftyBot:
                 LOG.exception("Command failed | message=%s", message)
                 self.telegram.send(f"<b>Command error</b>\n{tg_escape(exc)}")
 
-      def live_tick(self) -> None:
-        if not self.live_enabled:
-            self.live_scan_log("Live scan skipped | live disabled", force=True)
-            return
-        if not market_session_open():
-            self.live_scan_log("Live scan skipped | market closed | now=%s", now_ist())
-            return
-
-        self.live_scan_log(
-            "Live tick started | positions=%s | pending_buy=%s | strategies=%s",
-            len(self.order_manager.positions),
-            bool(self.order_manager.pending_entry_order_id),
-            ",".join(self.strategies.keys()),
-        )
-
-        self.order_manager.sync_pending_buy()
-        index_df = self.cache.current_closed_index()
-        if index_df.empty:
-            self.live_scan_log("Live scan skipped | no closed candles", force=True)
-            return
-
-        latest = index_df.iloc[-1]
-        self.live_scan_log(
-            "Live candles ready | rows=%s | latest_ts=%s | close=%s | high=%s | low=%s",
-            len(index_df),
-            latest.timestamp,
-            fmt(latest.close),
-            fmt(latest.high),
-            fmt(latest.low),
-        )
-
-        self.order_manager.manage_positions(index_df.reset_index(drop=True), self.strategies)
-        for name, strategy in self.strategies.items():
-            if not strategy.live_enabled:
-                LOG.debug("Live strategy skipped | strategy=%s | reason=strategy paused", name)
-                continue
-            try:
-                LOG.debug("Live strategy check started | strategy=%s | candles=%s", name, len(index_df))
-                signal = strategy.live_check(index_df.reset_index(drop=True))
-            except Exception as exc:
-                LOG.exception("Strategy live check failed | strategy=%s", name)
-                self.telegram.send(f"<b>{tg_escape(name)} live check error</b>\n{tg_escape(exc)}")
-                continue
-            if signal is not None:
-                LOG.warning("Live signal accepted | strategy=%s | trigger=%s", name, signal.trigger_key)
-                self.order_manager.handle_signal(signal)
-            else:
-                LOG.debug("Live strategy no signal | strategy=%s | latest_candle=%s", name, latest.timestamp)
+    def live_tick(self) -> None:
+            if not self.live_enabled:
+                self.live_scan_log("Live scan skipped | live disabled", force=True)
+                return
+            if not market_session_open():
+                self.live_scan_log("Live scan skipped | market closed | now=%s", now_ist())
+                return
+    
+            self.live_scan_log(
+                "Live tick started | positions=%s | pending_buy=%s | strategies=%s",
+                len(self.order_manager.positions),
+                bool(self.order_manager.pending_entry_order_id),
+                ",".join(self.strategies.keys()),
+            )
+    
+            self.order_manager.sync_pending_buy()
+            index_df = self.cache.current_closed_index()
+            if index_df.empty:
+                self.live_scan_log("Live scan skipped | no closed candles", force=True)
+                return
+    
+            latest = index_df.iloc[-1]
+            self.live_scan_log(
+                "Live candles ready | rows=%s | latest_ts=%s | close=%s | high=%s | low=%s",
+                len(index_df),
+                latest.timestamp,
+                fmt(latest.close),
+                fmt(latest.high),
+                fmt(latest.low),
+            )
+    
+            self.order_manager.manage_positions(index_df.reset_index(drop=True), self.strategies)
+            for name, strategy in self.strategies.items():
+                if not strategy.live_enabled:
+                    LOG.debug("Live strategy skipped | strategy=%s | reason=strategy paused", name)
+                    continue
+                try:
+                    LOG.debug("Live strategy check started | strategy=%s | candles=%s", name, len(index_df))
+                    signal = strategy.live_check(index_df.reset_index(drop=True))
+                except Exception as exc:
+                    LOG.exception("Strategy live check failed | strategy=%s", name)
+                    self.telegram.send(f"<b>{tg_escape(name)} live check error</b>\n{tg_escape(exc)}")
+                    continue
+                if signal is not None:
+                    LOG.warning("Live signal accepted | strategy=%s | trigger=%s", name, signal.trigger_key)
+                    self.order_manager.handle_signal(signal)
+                else:
+                    LOG.debug("Live strategy no signal | strategy=%s | latest_candle=%s", name, latest.timestamp)
     # def live_tick(self) -> None:
     #     if not self.live_enabled:
     #         return
